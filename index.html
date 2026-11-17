@@ -102,7 +102,7 @@
   var mcpNs = Object.freeze({
     callTool: function (server, tool, args) { return api('POST', '/api/mcp', { server: server, tool: tool, args: args || {} }); }
   });
-  var NS = { db: dbNs, assets: assetsNs, user: userNs, mcp: mcpNs };
+  var NS = { db: dbNs, assets: assetsNs, user: userNs };   // no Google Sheet here: gifts are managed in the admin page
   window.claude = Object.freeze({ use: function (n) { return Promise.resolve(NS[n] || null); } });
 
   /* admin sign-in: opening #admin on a device that is not signed in asks for the password */
@@ -402,7 +402,17 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
         <div class="stat"><p>Արդեն տրվել է</p><strong id="st-won">0</strong></div>
       </div>
 
-      <section class="sheet-box" aria-labelledby="sheet-title">
+      <section class="sheet-box" aria-labelledby="exp-title">
+        <div class="sheet-text">
+          <h2 id="exp-title">Արդյունքներ</h2>
+          <p>Ներբեռնեք ֆայլ Excel-ի համար՝ նվեր, քանակ, տրված, մնացած և խաղարկությունների պատմությունը։</p>
+        </div>
+        <div class="sheet-actions">
+          <button type="button" class="btn" id="export-csv">Ներբեռնել արդյունքները</button>
+        </div>
+      </section>
+
+      <section class="sheet-box" aria-labelledby="sheet-title" hidden>
         <div class="sheet-text">
           <h2 id="sheet-title">Նվերների ցանկը՝ Google Sheet-ից</h2>
           <p id="sheet-status" role="status">Բեռնվում է…</p>
@@ -431,7 +441,7 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
 
       <div class="a-grid">
         <form class="a-form" id="g-form" novalidate>
-          <h2 id="f-title">Նոր նվեր (աղյուսակից դուրս)</h2>
+          <h2 id="f-title">Նոր նվեր</h2>
           <div class="field">
             <label for="g-name">Անվանում</label>
             <input type="text" id="g-name" maxlength="80" autocomplete="off" required>
@@ -452,7 +462,7 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
                 <button type="button" class="btn ghost" id="g-img-clear" hidden>Հեռացնել նկարը</button>
               </div>
             </div>
-            <span class="hint">PNG թափանցիկ ֆոնով լավագույնն է։ Նկարը կարելի է տալ նաև աղյուսակի «Photo link» սյունակում՝ Google Drive-ի հղումով։</span>
+            <span class="hint">PNG թափանցիկ ֆոնով լավագույնն է։</span>
           </div>
           <div class="form-actions">
             <button type="submit" class="btn primary" id="f-submit">Ավելացնել</button>
@@ -1496,7 +1506,7 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
     if (S.capsResolved && !S.db) msg = 'Տվյալների բազան հասանելի չէ․ մուտք գործեք claude.ai, ապա բացեք էջի հղումը։';
     else if (S.noPlayRight) msg = 'Այս հաշիվը նվերներ գրանցելու իրավունք չունի։ Բացեք կիոսկի հատուկ հղումը (…/?key=…)։';
     else if (S.sync && !S.sync.ok && SYNC_ERR[S.sync.code]) msg = 'Google Sheet-ը չի կարդացվում․ նվերների ցանկը չի թարմանում (մանրամասները՝ #admin)։';
-    else if (S.ready && !S.gifts.some(function (g) { return isLive(g) && remaining(g) > 0; })) msg = 'Նվերների ցանկը դատարկ է կամ բոլորը տրված են․ ավելացրեք Google Sheet-ում։';
+    else if (S.ready && !S.gifts.some(function (g) { return isLive(g) && remaining(g) > 0; })) msg = 'Նվերների ցանկը դատարկ է կամ բոլորը տրված են․ ավելացրեք կառավարման էջում (#admin)։';
     s.textContent = msg; s.hidden = !msg;
   }
 
@@ -1612,7 +1622,7 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
     $('#g-form').reset(); $('#g-qty').value = 1; $('#g-qty').min = 0;
     $('#g-name').disabled = false; $('#g-qty').disabled = false;
     $('#g-qty-hint').textContent = 'Քանի հատ կարելի է տալ։ Ավարտվելուց հետո նվերն այլևս չի ընկնում։';
-    $('#f-title').textContent = 'Նոր նվեր (աղյուսակից դուրս)'; $('#f-submit').textContent = 'Ավելացնել'; $('#f-cancel').hidden = true;
+    $('#f-title').textContent = 'Նոր նվեր'; $('#f-submit').textContent = 'Ավելացնել'; $('#f-cancel').hidden = true;
     setPreview(''); renderAdmin();
   }
   function setPreview(src) {
@@ -1773,5 +1783,34 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
 })();
 </script>
 
+<script>
+// Results download for the admin: a tab-separated UTF-16 file that Excel opens with columns and Armenian text intact.
+(function () {
+  var btn = document.getElementById('export-csv'); if (!btn) return;
+  var label = btn.textContent;
+  btn.addEventListener('click', async function () {
+    btn.disabled = true;
+    try {
+      var db = await window.claude.use('db');
+      var gifts = (await db.collection('gifts').get()).docs.map(function (d) { return d.data(); }).sort(function (a, b) { return (a.createdAt || 0) - (b.createdAt || 0); });
+      var draws = (await db.collection('draws').orderBy('at', 'desc').get()).docs.map(function (d) { return d.data(); });
+      var cell = function (v) { return String(v == null ? '' : v).replace(/[\t\r\n]+/g, ' '); };
+      var two = function (n) { return (n < 10 ? '0' : '') + n; };
+      var rows = [['Նվեր', 'Քանակ', 'Տրված', 'Մնացած']];
+      gifts.forEach(function (g) { var q = Number(g.quantity) || 0, w = Number(g.won) || 0; rows.push([g.name || '', q, w, Math.max(0, q - w)]); });
+      rows.push([]); rows.push(['Ամսաթիվ', 'Նվեր', 'Պատուհան']);
+      draws.forEach(function (d) { var t = new Date(d.at || 0); rows.push([t.getFullYear() + '-' + two(t.getMonth() + 1) + '-' + two(t.getDate()) + ' ' + two(t.getHours()) + ':' + two(t.getMinutes()), d.giftName || '', d.door || '']); });
+      var text = rows.map(function (r) { return r.map(cell).join('\t'); }).join('\r\n');
+      var buf = new Uint8Array(2 + text.length * 2); buf[0] = 0xFF; buf[1] = 0xFE;
+      for (var i = 0; i < text.length; i++) { var c = text.charCodeAt(i); buf[2 + i * 2] = c & 255; buf[3 + i * 2] = c >> 8; }
+      var a = document.createElement('a'), n = new Date();
+      a.href = URL.createObjectURL(new Blob([buf], { type: 'text/csv' }));
+      a.download = 'advent-results-' + n.getFullYear() + two(n.getMonth() + 1) + two(n.getDate()) + '.csv';
+      document.body.appendChild(a); a.click(); a.remove(); setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+    } catch (e) { btn.textContent = 'Չհաջողվեց, փորձեք կրկին'; setTimeout(function () { btn.textContent = label; }, 2500); }
+    btn.disabled = false;
+  });
+})();
+</script>
 </body>
 </html>
