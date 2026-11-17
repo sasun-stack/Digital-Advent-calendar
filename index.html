@@ -484,6 +484,7 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
         <div class="set-row">
           <div class="set-text"><strong id="fx-title">Պատուհանի բացման էֆեկտ</strong><span>Ինչ է դուրս գալիս պատուհանից՝ մինչև նվերի քարտի հայտնվելը։</span></div>
           <select id="fx-select" class="btn" aria-labelledby="fx-title">
+            <option value="comet">Ձյան հոսք և բռնկում</option>
             <option value="vortex">Ձնե մրրիկ</option>
             <option value="galaxy">Ձյան պտույտ (գալակտիկա)</option>
             <option value="tornado">Ձյան տորնադո</option>
@@ -523,7 +524,7 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
   var reduceMotion = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   /* ---------------- shared state ---------------- */
-  var S = { db: null, assets: null, user: null, canEdit: false, ready: false, capsResolved: false, gifts: [], draws: [], mode: 'idle', mcp: null, sync: null, syncing: false, syncAgain: false, wonFloor: {}, photoFail: {}, importing: false, effect: 'vortex' };
+  var S = { db: null, assets: null, user: null, canEdit: false, ready: false, capsResolved: false, gifts: [], draws: [], mode: 'idle', mcp: null, sync: null, syncing: false, syncAgain: false, wonFloor: {}, photoFail: {}, importing: false, effect: 'comet' };
   var remaining = function (g) { return Math.max(0, (Number(g.quantity) || 0) - (Number(g.won) || 0)); };
   var imgUrl = function (id) { return id ? '/_blob/' + id : ''; };
   // A gift can be drawn when it is switched on and still listed in the Google Sheet.
@@ -834,7 +835,7 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
   }
 
   function buildCardFx() {
-    setTimeout(function () { if (reduceMotion) return; ensureSprites(); if (S.effect === 'galaxy') { if (!galaxy) galaxy = buildGalaxy(); } else if (!vortex) vortex = buildVortex(); }, 400);   // paint the spiral once, before anyone taps
+    setTimeout(function () { if (reduceMotion) return; ensureSprites(); if (S.effect === 'galaxy') { if (!galaxy) galaxy = buildGalaxy(); } else if (S.effect === 'vortex' && !vortex) vortex = buildVortex(); }, 400);   // paint the spiral once, before anyone taps
     preloadGift(null);                                   // the default picture, decoded once at start
     var fx = el('div', 'card-fx');
     [380, 510].forEach(function (d) { var r = el('span', 'ring'); r.style.setProperty('--d', d + 'px'); fx.appendChild(r); });
@@ -891,7 +892,7 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
   }
 
   /* --- snow gust: a light swirl of snow drifts out of the opened window, floats to the centre and settles; the card appears in it --- */
-  var STORM = { lead: 260, total: 1500, vortex: 900 };          // ms after the tap: when the gust starts, when the card appears
+  var STORM = { lead: 260, total: 1500, vortex: 900, comet: 1220 };          // ms after the tap: when the gust starts, when the card appears
   var storm = { parts: [], running: false, t0: 0, last: 0, ex: 0, ey: 0, spawned: 0, sprites: null };
   function snowDot(rgb, core) {
     var c = document.createElement('canvas'); c.width = c.height = 64;
@@ -916,15 +917,15 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
     if (reduceMotion) return;
     var r = cell.getBoundingClientRect();
     storm.ex = r.left + r.width / 2; storm.ey = r.top + r.height / 2;
-    storm.parts = []; storm.spawned = 0; storm.lx = null; storm.ly = null; storm.lp = null; storm.acc = 0; storm.revealT = null; storm.t0 = performance.now(); storm.last = storm.t0;
+    storm.parts = []; storm.spawned = 0; storm.lx = null; storm.ly = null; storm.lp = null; storm.acc = 0; storm.revealT = null; storm.path = null; storm.burst = false; storm.t0 = performance.now(); storm.last = storm.t0;
     ensureSprites();
     if (!storm.sprites) storm.sprites = { snow: snowDot('255,255,255', 0.95), blush: snowDot('255,222,234', 0.9), flake: snowFlake() };
     $('#storm-veil').classList.add('on');
-    if (!storm.running) { storm.running = true; requestAnimationFrame(S.effect === 'swirl' ? stepSwirl : S.effect === 'ribbon' ? stepRibbon : S.effect === 'tornado' ? stepTornado : S.effect === 'galaxy' ? stepGalaxy : stepVortex); }
+    if (!storm.running) { storm.running = true; requestAnimationFrame(S.effect === 'swirl' ? stepSwirl : S.effect === 'ribbon' ? stepRibbon : S.effect === 'tornado' ? stepTornado : S.effect === 'galaxy' ? stepGalaxy : S.effect === 'vortex' ? stepVortex : stepComet); }
   }
   function stopStorm() {
     storm.running = false; storm.parts = [];
-    var c = $('#storm'); c.getContext('2d').clearRect(0, 0, innerWidth, innerHeight);
+    var c = $('#storm'); c.getContext('2d').clearRect(0, 0, innerWidth, innerHeight); c.style.zIndex = '';
     $('#storm-veil').classList.remove('on');
   }
   // Variant "swirl": the snow spins out of the window as a small whirl, floats to the centre and settles.
@@ -993,6 +994,96 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
     ctx.globalAlpha = 1;
     if (t > 2.35) { stopStorm(); return; }
     requestAnimationFrame(stepSwirl);
+  }
+
+  // Variant "comet" (after the reference clip): a stream of snow leaves the gift box, sweeps round the screen in a
+  // closing spiral and ends at the centre in a soft white burst, out of which the gift card appears.
+  function stepComet(ts) {
+    if (!storm.running) return;
+    var c = $('#storm'), ctx = c.getContext('2d'), W = innerWidth, H = innerHeight;
+    var t = (ts - storm.t0) / 1000, dt = Math.min(0.05, (ts - storm.last) / 1000); storm.last = ts;
+    var M = Math.min(W, H), u = M / 1080, sp = storm.sprites;
+    var smooth = function (x) { x = clamp01(x); return x * x * (3 - 2 * x); };
+    var FLY = 0.9, FLAT = 0.62, TURNS = 1.5;
+    var cx = W / 2, cy = H / 2 - 40 * u;
+    if (!storm.path) {                                   // the spiral starts exactly at the opened window
+      var dx = storm.ex - cx, dy = (storm.ey - cy) / FLAT, r0 = Math.hypot(dx, dy);
+      storm.path = { r0: r0, th0: Math.atan2(dy, dx), dir: dx > 0 ? 1 : -1, wide: Math.max(0.12 * M, 0.37 * M - 0.45 * r0) };
+    }
+    var P = storm.path;
+    c.style.zIndex = '12';                               // above the card: the burst hides it for a moment, then fades to reveal it
+    var at = function (tau) {
+      tau = clamp01(tau);
+      var th = P.th0 + P.dir * TURNS * 2 * Math.PI * (0.55 * tau + 0.45 * tau * tau);
+      var r = P.r0 * Math.pow(1 - tau, 1.4) + P.wide * Math.sin(Math.PI * tau) * (1 - 0.3 * tau);
+      return [cx + Math.cos(th) * r, cy + Math.sin(th) * r * FLAT];
+    };
+    // the burst waits for the card: if saving the prize is slow, the snow keeps circling at the centre meanwhile
+    var rv = storm.revealT, flashT = rv == null ? null : Math.max(rv, FLY);
+    var flying = t < FLY, waiting = !flying && flashT == null;
+    var head = flying ? at(t / FLY) : [cx + Math.cos(t * 12) * 22 * u, cy + Math.sin(t * 12) * 22 * u * FLAT];
+    if (storm.lx == null) { storm.lx = head[0]; storm.ly = head[1]; }
+    if ((flying || waiting) && storm.parts.length < 2200) {
+      var hvx = (head[0] - storm.lx) / Math.max(dt, 0.004), hvy = (head[1] - storm.ly) / Math.max(dt, 0.004);
+      var tau = clamp01(t / FLY), spread = (20 + 50 * (1 - tau)) * u;
+      storm.acc += (flying ? 1900 : 260) * dt;
+      var n = Math.floor(storm.acc); storm.acc -= n;
+      for (var i = 0; i < n; i++) {
+        var f = Math.random(), k = Math.random();
+        storm.parts.push({
+          x: storm.lx + (head[0] - storm.lx) * f + (Math.random() + Math.random() - 1) * spread,
+          y: storm.ly + (head[1] - storm.ly) * f + (Math.random() + Math.random() - 1) * spread,
+          vx: hvx * 0.07 + (Math.random() - 0.5) * 60 * u, vy: hvy * 0.07 + (Math.random() - 0.5) * 60 * u,
+          s: (1.3 + Math.random() * Math.random() * 5.2) * u, born: t - (1 - f) * dt, life: 0.75 + Math.random() * 0.75,
+          ph: Math.random() * 6.283, k: k < 0.09 ? 2 : k < 0.45 ? 1 : 0, vr: (Math.random() - 0.5) * 5
+        });
+      }
+    }
+    storm.lx = head[0]; storm.ly = head[1];
+    if (flashT != null && t >= flashT && !storm.burst) {  // the burst throws a ring of snow outwards
+      storm.burst = true;
+      for (var b = 0; b < 150; b++) {
+        var a = Math.random() * 6.283, v = (140 + Math.random() * 780) * u, kb = Math.random();
+        storm.parts.push({ x: cx, y: cy, vx: Math.cos(a) * v, vy: Math.sin(a) * v * 0.8, s: (1 + Math.random() * 3.2) * u, born: t, life: 0.5 + Math.random() * 0.6,
+          ph: Math.random() * 6.283, k: kb < 0.12 ? 2 : kb < 0.5 ? 1 : 0, vr: (Math.random() - 0.5) * 6, b: 1 });
+      }
+    }
+
+    ctx.clearRect(0, 0, W, H);
+    var ft = flashT == null ? -1 : t - flashT;
+    var out = ft < 0 ? 0 : smooth((ft - 0.25) / 0.6);       // everything melts away behind the card
+    var dim = 0.56 * smooth(t / 0.25) * (ft < 0 ? 1 : 1 - smooth(ft / 0.14));   // a night sky under the snow; the card brings its own dimming
+    if (dim > 0.01) { ctx.globalAlpha = dim; ctx.fillStyle = '#12162A'; ctx.fillRect(0, 0, W, H); }
+
+    var drag = Math.pow(0.12, dt), g = 46 * u * dt;
+    for (var p = storm.parts.length - 1; p >= 0; p--) {
+      var q = storm.parts[p], age = t - q.born;
+      if (age > q.life) { storm.parts[p] = storm.parts[storm.parts.length - 1]; storm.parts.pop(); continue; }
+      if (ft >= 0 && !q.b) { q.vx += (cx - q.x) * 16 * dt; q.vy += (cy - q.y) * 16 * dt; }   // the trail is drawn into the burst
+      q.vx *= drag; q.vy = q.vy * drag + g; q.x += q.vx * dt; q.y += q.vy * dt;
+      var al = smooth(age / 0.05) * (1 - smooth((age - q.life * 0.45) / (q.life * 0.55))) * (0.62 + 0.38 * Math.sin(t * 14 + q.ph)) * (1 - out);
+      if (al < 0.02) continue;
+      ctx.globalAlpha = al;
+      if (q.k === 2) {
+        var z = q.s * 4.2; ctx.save(); ctx.translate(q.x, q.y); ctx.rotate(q.ph + q.vr * age); ctx.drawImage(sp.flake, -z, -z, z * 2, z * 2); ctx.restore();
+      } else { var d = q.s * 2; ctx.drawImage(q.k ? sp.blush : sp.snow, q.x - d, q.y - d, d * 2, d * 2); }
+    }
+    if (flying || waiting) {                               // the bright head of the stream
+      var hz = (flying ? 44 : 34) * u, ha = smooth(t / 0.08);
+      ctx.globalAlpha = 0.4 * ha; ctx.drawImage(sp.blush, head[0] - hz * 1.5, head[1] - hz * 1.5, hz * 3, hz * 3);
+      ctx.globalAlpha = 0.95 * ha; ctx.drawImage(sp.snow, head[0] - hz / 2, head[1] - hz / 2, hz, hz);
+    }
+    if (ft >= 0) {
+      var fa = smooth(ft / 0.08) * (1 - smooth((ft - 0.1) / 0.6));
+      if (fa > 0.01) {
+        var fz = (620 + 1300 * smooth(ft / 0.4)) * u;
+        ctx.globalAlpha = fa; ctx.drawImage(sp.snow, cx - fz / 2, cy - fz / 2, fz, fz);
+        ctx.globalAlpha = fa * 0.9; ctx.drawImage(sp.snow, cx - fz * 0.3, cy - fz * 0.3, fz * 0.6, fz * 0.6);
+      }
+    }
+    ctx.globalAlpha = 1;
+    if ((ft > 1.0) || t > 12) { stopStorm(); return; }
+    requestAnimationFrame(stepComet);
   }
 
   // Variant "vortex" (after the second reference picture): a snow whirlpool seen face-on. Dozens of curved, brushy
@@ -1432,7 +1523,7 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
     prepareReveal(gift);
     cell.classList.add('is-open');
     var stormTimer = setTimeout(function () { startStorm(cell); }, STORM.lead);     // once the leaf has swung away
-    var result = await Promise.all([commitDraw(gift, t.n).then(function () { return true; }, function (e) { return e || false; }), sleep(reduceMotion ? 100 : S.effect === 'vortex' ? STORM.vortex : STORM.total)]);
+    var result = await Promise.all([commitDraw(gift, t.n).then(function () { return true; }, function (e) { return e || false; }), sleep(reduceMotion ? 100 : (STORM[S.effect] || STORM.total))]);
     if (result[0] !== true) {
       clearTimeout(stormTimer); stopStorm(); cancelReveal();
       cell.classList.remove('is-open');
@@ -1701,7 +1792,7 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
     $('#f-cancel').addEventListener('click', resetForm);
     $('#sheet-link').href = SHEET.url;
     $('#fx-select').addEventListener('change', function () {
-      var v = ['swirl', 'ribbon', 'tornado', 'galaxy', 'vortex'].indexOf(this.value) >= 0 ? this.value : 'vortex'; S.effect = v;
+      var v = ['swirl', 'ribbon', 'tornado', 'galaxy', 'vortex', 'comet'].indexOf(this.value) >= 0 ? this.value : 'comet'; S.effect = v;
       if (S.db) S.db.doc('config/kiosk').set({ effect: v }).then(function () { toast('Պահպանվեց'); }, function () { toast('Չհաջողվեց պահպանել'); });
     });
     $('#sheet-sync').addEventListener('click', function () { syncFromSheet('manual'); });
@@ -1788,7 +1879,7 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
       }, function () { kioskStatus(); });
       S.db.doc('config/kiosk').onSnapshot(function (snap) {
         var d = snap.exists ? snap.data() : null;
-        S.effect = (d && ['swirl', 'ribbon', 'tornado', 'galaxy', 'vortex'].indexOf(d.effect) >= 0) ? d.effect : 'vortex';
+        S.effect = (d && ['swirl', 'ribbon', 'tornado', 'galaxy', 'vortex', 'comet'].indexOf(d.effect) >= 0) ? d.effect : 'comet';
         var sel = $('#fx-select'); if (sel) sel.value = S.effect;
       }, function () {});
       S.db.collection('draws').orderBy('at', 'desc').limit(100).onSnapshot(function (snap) {
