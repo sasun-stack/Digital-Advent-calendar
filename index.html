@@ -279,6 +279,12 @@ button{font-family:inherit;}
 .btn.ghost{background:transparent;}
 .btn.danger{color:var(--danger);border-color:rgba(255,154,154,.4);background:transparent;}
 .btn.danger.armed{background:#8A1838;color:#fff;border-color:var(--danger);}
+.confirm{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(14,14,20,.74);}
+.confirm-box{width:min(480px,100%);box-sizing:border-box;padding:26px;border-radius:20px;background:var(--surface);border:1px solid var(--line);box-shadow:0 24px 60px rgba(0,0,0,.5);}
+.confirm-box h2{margin:0 0 10px;font-size:21px;font-weight:600;color:var(--cream);}
+.confirm-box p{margin:0 0 22px;font-size:15px;line-height:1.5;color:var(--muted);}
+.confirm-actions{display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;}
+.confirm-actions .btn[disabled]{opacity:.45;cursor:not-allowed;}
 .btn[disabled]{opacity:.5;cursor:not-allowed;}
 .stats{display:grid;grid-template-columns:repeat(auto-fit, minmax(min(180px,100%),1fr));gap:12px;}
 .stat{padding:16px 18px;border-radius:14px;background:var(--surface);border:1px solid var(--line);}
@@ -493,6 +499,16 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
         </div>
         <p class="hint" id="log-note" style="margin:0;font-size:13px;color:var(--faint)"></p>
       </section>
+    </div>
+  </div>
+  <div id="confirm" class="confirm" hidden role="alertdialog" aria-modal="true" aria-labelledby="cf-title" aria-describedby="cf-text">
+    <div class="confirm-box">
+      <h2 id="cf-title"></h2>
+      <p id="cf-text"></p>
+      <div class="confirm-actions">
+        <button type="button" class="btn primary" id="cf-cancel">Չեղարկել</button>
+        <button type="button" class="btn danger" id="cf-ok"></button>
+      </div>
     </div>
   </div>
 </main>
@@ -1536,6 +1552,30 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
     });
   }
 
+  // Destructive actions ask in a popup; the confirm button only wakes up after a short countdown, so a stray
+  // double tap cannot wipe the results.
+  function askConfirm(title, text, okLabel) {
+    return new Promise(function (resolve) {
+      var box = $('#confirm'), ok = $('#cf-ok'), cancel = $('#cf-cancel'), left = 3, timer = 0;
+      $('#cf-title').textContent = title; $('#cf-text').textContent = text;
+      var tick = function () { ok.disabled = left > 0; ok.textContent = left > 0 ? okLabel + ' (' + left + ')' : okLabel; if (left > 0) { left--; timer = setTimeout(tick, 1000); } };
+      var onKey = function (e) { if (e.key === 'Escape') done(false); };
+      var done = function (v) { clearTimeout(timer); box.hidden = true; ok.onclick = cancel.onclick = box.onclick = null; document.removeEventListener('keydown', onKey); resolve(v); };
+      ok.onclick = function () { if (!ok.disabled) done(true); };
+      cancel.onclick = function () { done(false); };
+      box.onclick = function (e) { if (e.target === box) done(false); };
+      document.addEventListener('keydown', onKey);
+      box.hidden = false; tick(); cancel.focus();
+    });
+  }
+  function guardButton(btn, title, text, okLabel, action) {
+    btn.addEventListener('click', async function () {
+      if (!(await askConfirm(title, text, okLabel))) return;
+      btn.disabled = true;
+      try { await action(); } finally { btn.disabled = false; }
+    });
+  }
+
   function renderAdmin() {
     if ($('#admin').hidden) return;
     var lock = $('#a-lock'), body = $('#a-body');
@@ -1708,15 +1748,16 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
         await Promise.all(snap.docs.map(function (d) { return S.db.doc('draws/' + d.id).delete(); }));
       }
     }
-    armButton($('#clear-log'), 'Հաստատե՞լ մաքրումը', async function () {
+    guardButton($('#clear-log'), 'Մաքրե՞լ պատմությունը', 'Տրված նվերների ամբողջ պատմությունը կջնջվի։ Տրված քանակները չեն փոխվի։ Այս գործողությունը հնարավոր չէ հետ շրջել։', 'Այո, մաքրել', async function () {
       try { await deleteAllDraws(); toast('Պատմությունը մաքրվեց'); } catch (e) { toast('Չհաջողվեց մաքրել'); }
     });
-    armButton($('#reset-all'), 'Հաստատե՞լ զրոյացումը', async function () {
+    guardButton($('#reset-all'), 'Զրոյացնե՞լ տրված քանակները', 'Բոլոր նվերների «տրված» քանակը կդառնա 0, և պատմությունը կջնջվի։ Օգտագործեք միայն թեստից հետո՝ խաղարկությունը սկսելուց առաջ։ Այս գործողությունը հնարավոր չէ հետ շրջել։', 'Այո, զրոյացնել', async function () {
       try {
         await Promise.all(S.gifts.map(function (g) { return S.db.doc('gifts/' + g.id).update({ won: 0 }); }));
         S.wonFloor = {}; S.lastGiftId = null;
         await deleteAllDraws();
-        setTimeout(function () { syncFromSheet('manual'); }, 400);   // the sheet's Won column goes back to 0 too toast('Տրված քանակները զրոյացվեցին');
+        setTimeout(function () { syncFromSheet('manual'); }, 400);   // the sheet's Won column goes back to 0 too
+        toast('Տրված քանակները զրոյացվեցին');
       } catch (e) { toast('Չհաջողվեց զրոյացնել'); }
     });
   }
