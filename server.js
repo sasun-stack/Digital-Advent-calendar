@@ -214,9 +214,23 @@ app.post('/api/mcp', async (req, res) => {
 });
 
 /* ---------------- the page ---------------- */
-app.use(express.static(path.join(__dirname, 'public'), {
-  setHeaders: (res, file) => { if (file.endsWith('.html')) res.set('Cache-Control', 'no-cache'); else res.set('Cache-Control', 'public, max-age=86400'); }
-}));
+// Works whether the files sit in public/ (and public/tiles/) or were uploaded flat next to server.js.
+const setHeaders = (res, file) => { if (file.endsWith('.html')) res.set('Cache-Control', 'no-cache'); else res.set('Cache-Control', 'public, max-age=86400'); };
+const PUB = path.join(__dirname, 'public');
+if (fs.existsSync(path.join(PUB, 'index.html'))) {
+  app.use(express.static(PUB, { setHeaders }));
+} else {
+  const SAFE = /^\/(?:tiles\/)?[A-Za-z0-9_.-]+\.(?:html|jpg|jpeg|png|svg|webp)$/;
+  const find = (rel) => [path.join(__dirname, rel), path.join(__dirname, path.basename(rel)), path.join(PUB, rel), path.join(PUB, path.basename(rel))].find(f => fs.existsSync(f));
+  app.get(/.*/, (req, res, next) => {
+    const p = req.path === '/' ? '/index.html' : req.path;
+    if (!SAFE.test(p)) return next();
+    const f = find(p.slice(1));
+    if (!f) return next();
+    setHeaders(res, f);
+    res.sendFile(f);
+  });
+}
 
 app.listen(PORT, () => {
   console.log('Advent calendar on port ' + PORT + ', data in ' + DATA);
