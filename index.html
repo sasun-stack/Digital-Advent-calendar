@@ -16,10 +16,10 @@
   // The kiosk opens the page once as /?key=XXXX; the key is kept on that device and taken out of the address.
   var qs = new URLSearchParams(location.search);
   if (qs.get('key')) {
-    LS.set('advent.token', 'k:' + qs.get('key')); qs.delete('key');
+    LS.set('advent.kiosk', 'k:' + qs.get('key')); qs.delete('key');
     history.replaceState(null, '', location.pathname + (qs.toString() ? '?' + qs : '') + location.hash);
   }
-  var token = function () { return LS.get('advent.token') || ''; };
+  var token = function () { var old = LS.get('advent.token') || ''; return LS.get('advent.admin') || (old.indexOf('a:') === 0 ? old : '') || LS.get('advent.kiosk') || old; };
   var noop = function () {};
   function err(code) { var e = new Error(code); e.code = code; return e; }
   async function api(method, url, body, raw) {
@@ -125,7 +125,7 @@
     box.querySelector('a').addEventListener('click', function (ev) { ev.preventDefault(); location.hash = ''; box.remove(); });
     f.addEventListener('submit', async function (ev) {
       ev.preventDefault(); e.hidden = true;
-      try { var j = await api('POST', '/api/login', { password: inp.value }); LS.set('advent.token', j.token); location.reload(); }
+      try { var j = await api('POST', '/api/login', { password: inp.value }); LS.set('advent.admin', j.token); location.reload(); }
       catch (x) { e.hidden = false; inp.select(); }
     });
   }
