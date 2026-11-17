@@ -483,7 +483,7 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
 
       <section class="a-set" aria-labelledby="set-title">
         <h2 id="set-title">Կարգավորումներ</h2>
-        <div class="set-row">
+        <div class="set-row" hidden>
           <div class="set-text"><strong id="fx-title">Պատուհանի բացման էֆեկտ</strong><span>Ինչ է դուրս գալիս պատուհանից՝ մինչև նվերի քարտի հայտնվելը։</span></div>
           <select id="fx-select" class="btn" aria-labelledby="fx-title">
             <option value="comet">Ձյան հոսք և բռնկում</option>
@@ -1881,7 +1881,7 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
       }, function () { kioskStatus(); });
       S.db.doc('config/kiosk').onSnapshot(function (snap) {
         var d = snap.exists ? snap.data() : null;
-        S.effect = (d && ['swirl', 'ribbon', 'tornado', 'galaxy', 'vortex', 'comet'].indexOf(d.effect) >= 0) ? d.effect : 'comet';
+        S.effect = 'comet';   // the only animation in use
         var sel = $('#fx-select'); if (sel) sel.value = S.effect;
       }, function () {});
       S.db.collection('draws').orderBy('at', 'desc').limit(100).onSnapshot(function (snap) {
