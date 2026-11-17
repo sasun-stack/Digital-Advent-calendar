@@ -1,0 +1,1777 @@
+<!doctype html>
+<html lang="hy">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>html,body{margin:0;background:#282832}[hidden]{display:none!important}</style>
+<script>
+// Stands in for claude.ai's window.claude on the self-hosted page: the same db / assets / user / mcp calls,
+// served by this app's own server. The kiosk page itself is unchanged.
+(function () {
+  var LS = {
+    get: function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set: function (k, v) { try { localStorage.setItem(k, v); } catch (e) { /* private mode */ } },
+    del: function (k) { try { localStorage.removeItem(k); } catch (e) { /* private mode */ } }
+  };
+  // The kiosk opens the page once as /?key=XXXX; the key is kept on that device and taken out of the address.
+  var qs = new URLSearchParams(location.search);
+  if (qs.get('key')) {
+    LS.set('advent.token', 'k:' + qs.get('key')); qs.delete('key');
+    history.replaceState(null, '', location.pathname + (qs.toString() ? '?' + qs : '') + location.hash);
+  }
+  var token = function () { return LS.get('advent.token') || ''; };
+  var noop = function () {};
+  function err(code) { var e = new Error(code); e.code = code; return e; }
+  async function api(method, url, body, raw) {
+    var h = {}, t = token(), opt = { method: method, headers: h };
+    if (t) h.Authorization = 'Bearer ' + t;
+    if (raw) { opt.body = raw; h['Content-Type'] = raw.type || 'application/octet-stream'; }
+    else if (body !== undefined) { opt.body = JSON.stringify(body); h['Content-Type'] = 'application/json'; }
+    var r; try { r = await fetch(url, opt); } catch (e) { throw err('unavailable'); }
+    var j = null; try { j = await r.json(); } catch (e) { /* empty body */ }
+    if (!r.ok) throw err((j && j.code) || (r.status === 401 || r.status === 403 ? 'permission_denied' : r.status === 404 ? 'not_found' : 'unavailable'));
+    return j;
+  }
+  var enc = encodeURIComponent;
+  var clone = function (v) { return v == null ? v : JSON.parse(JSON.stringify(v)); };
+
+  /* live updates: the server names the collection that changed; listeners on it fetch again */
+  var listeners = [];
+  function refresh(col) {
+    listeners.forEach(function (l) {
+      if (col && l.col !== col) return;
+      clearTimeout(l.timer); l.timer = setTimeout(l.run, 40);
+    });
+  }
+  var es = null, wasDown = false;
+  function openEvents() {
+    if (es || typeof EventSource === 'undefined') return;
+    es = new EventSource('/api/events');
+    es.onmessage = function (ev) { try { refresh(JSON.parse(ev.data).col); } catch (e) { /* ignore */ } };
+    es.onerror = function () { wasDown = true; };
+    es.onopen = function () { if (wasDown) { wasDown = false; refresh(null); } };
+  }
+  setInterval(function () { refresh(null); }, 60000);        // safety net if an event was missed
+  function listen(col, run) {
+    var l = { col: col, run: run, timer: 0 }; listeners.push(l); openEvents(); run();
+    return function () { var i = listeners.indexOf(l); if (i >= 0) listeners.splice(i, 1); clearTimeout(l.timer); };
+  }
+
+  var docSnap = function (id, data) { return { id: id, exists: data != null, data: function () { return data != null ? clone(data) : undefined; } }; };
+  var colSnap = function (list) { return { empty: !list.length, size: list.length, docs: list.map(function (d) { return { id: d.id, exists: true, data: function () { return clone(d.data); } }; }) }; };
+  function query(col, ord, lim) {
+    return {
+      orderBy: function (f, dir) { return query(col, { f: f, dir: dir || 'asc' }, lim); },
+      limit: function (n) { return query(col, ord, n); },
+      get: async function () {
+        var p = new URLSearchParams();
+        if (ord) { p.set('orderBy', ord.f); p.set('dir', ord.dir); }
+        if (lim) p.set('limit', lim);
+        return colSnap(await api('GET', '/api/col/' + enc(col) + '?' + p));
+      },
+      onSnapshot: function (next, onErr) { var q = this; return listen(col, function () { q.get().then(next, onErr || noop); }); }
+    };
+  }
+  function docRef(p) {
+    var i = p.indexOf('/'), col = p.slice(0, i), id = p.slice(i + 1), u = '/api/doc/' + enc(col) + '/' + enc(id);
+    return {
+      id: id,
+      get: async function () { var j = await api('GET', u); return docSnap(id, j.exists ? j.data : null); },
+      set: function (d) { return api('PUT', u, d).then(noop); },
+      update: function (d) { return api('PATCH', u, d).then(noop); },
+      delete: function () { return api('DELETE', u).then(noop); },
+      onSnapshot: function (next, onErr) { var r = this; return listen(col, function () { r.get().then(next, onErr || noop); }); }
+    };
+  }
+  var dbNs = Object.freeze({ collection: function (c) { return query(c, null, 0); }, doc: docRef });
+  var assetsNs = Object.freeze({
+    upload: async function (blob, opts) {
+      var b = (opts && opts.type && blob.type !== opts.type) ? new Blob([blob], { type: opts.type }) : blob;
+      return api('POST', '/api/assets', undefined, b);
+    },
+    delete: function (id) { return api('DELETE', '/api/assets/' + enc(id)).then(noop); }
+  });
+  var me = null;
+  function whoami() { if (!me) me = api('GET', '/api/me').catch(function () { return { role: 'viewer' }; }); return me; }
+  var userNs = Object.freeze({
+    isOwner: async function () { return (await whoami()).role === 'admin'; },
+    canEdit: async function () { return (await whoami()).role === 'admin'; },
+    canSync: async function () { var r = (await whoami()).role; return r === 'admin' || r === 'kiosk'; },
+    can: async function () { return null; }
+  });
+  var mcpNs = Object.freeze({
+    callTool: function (server, tool, args) { return api('POST', '/api/mcp', { server: server, tool: tool, args: args || {} }); }
+  });
+  var NS = { db: dbNs, assets: assetsNs, user: userNs, mcp: mcpNs };
+  window.claude = Object.freeze({ use: function (n) { return Promise.resolve(NS[n] || null); } });
+
+  /* admin sign-in: opening #admin on a device that is not signed in asks for the password */
+  function loginBox() {
+    if (document.getElementById('adv-login')) return;
+    var box = document.createElement('div'); box.id = 'adv-login';
+    box.innerHTML = '<form><h2>Կառավարում</h2><p>Մուտքագրեք ադմինիստրատորի գաղտնաբառը</p>' +
+      '<input type="password" autocomplete="current-password" required><button type="submit">Մուտք</button><p class="e" hidden>Սխալ գաղտնաբառ</p>' +
+      '<a href="#">← Օրացույց</a></form>';
+    var css = document.createElement('style');
+    css.textContent = '#adv-login{position:fixed;inset:0;z-index:99;display:grid;place-items:center;background:rgba(20,22,32,.92);font-family:"Noto Sans Armenian",system-ui,sans-serif}' +
+      '#adv-login form{background:#fff;color:#222;border-radius:18px;padding:28px;width:min(360px,90vw);display:grid;gap:12px;text-align:center}' +
+      '#adv-login h2{margin:0;font-size:22px}#adv-login p{margin:0;color:#666;font-size:14px}#adv-login .e{color:#c0264f}' +
+      '#adv-login input{font:inherit;font-size:17px;padding:12px;border:1px solid #ccc;border-radius:10px}' +
+      '#adv-login button{font:inherit;font-weight:600;font-size:16px;padding:12px;border:0;border-radius:10px;background:#D93E83;color:#fff;cursor:pointer}' +
+      '#adv-login a{color:#666;font-size:14px}';
+    box.appendChild(css); document.body.appendChild(box);
+    var f = box.querySelector('form'), inp = box.querySelector('input'), e = box.querySelector('.e');
+    inp.focus();
+    box.querySelector('a').addEventListener('click', function (ev) { ev.preventDefault(); location.hash = ''; box.remove(); });
+    f.addEventListener('submit', async function (ev) {
+      ev.preventDefault(); e.hidden = true;
+      try { var j = await api('POST', '/api/login', { password: inp.value }); LS.set('advent.token', j.token); location.reload(); }
+      catch (x) { e.hidden = false; inp.select(); }
+    });
+  }
+  async function checkAdmin() {
+    if (location.hash !== '#admin') { var b = document.getElementById('adv-login'); if (b) b.remove(); return; }
+    if ((await whoami()).role !== 'admin') loginBox();
+  }
+  addEventListener('hashchange', checkAdmin);
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', checkAdmin); else checkAdmin();
+})();
+
+</script>
+<title>Ամանորյա ադվենտ օրացույց</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+Armenian:wght@400;500;600;700&family=Noto+Serif+Armenian:wght@500;600;700&display=swap">
+</head>
+<body>
+<style>
+/* Layout: kiosk = the YM_Advent artwork (1600x2692) scaled to fit the screen, its 12 tiles are the doors;
+   the gift card is laid out in screen space so it stays large on any orientation.
+   admin (#admin) = ordinary scrolling page. One committed dark slate-and-pink look, taken from the artwork. */
+:root{
+  color-scheme: dark;
+  --bg:#282832;
+  --bg-deep:#1C1C24;
+  --surface:#32323E;
+  --surface-2:#3D3D4B;
+  --line:rgba(246,169,192,.28);
+  --accent:#F6A9C0;
+  --accent-hi:#FFD3DF;
+  --accent-deep:#E4196B;
+  --cream:#FFF1E6;
+  --ink:#2A1420;
+  --card:#D93E83;
+  --card-line:#F4A2C6;
+  --muted:rgba(255,241,230,.76);
+  --faint:rgba(255,241,230,.52);
+  --ok:#8FD9A8;
+  --danger:#FF9A9A;
+  --font-display:'Noto Serif Armenian','Noto Serif',Georgia,serif;
+  --font-body:'Noto Sans Armenian','Noto Sans',system-ui,sans-serif;
+}
+html,body{background:var(--bg);color:var(--cream);font-family:var(--font-body);}
+html.is-kiosk,html.is-kiosk body{height:100%;overflow:hidden;}
+button{font-family:inherit;}
+[hidden]{display:none !important;}
+
+/* ================= KIOSK ================= */
+#kiosk{position:fixed;inset:0;overflow:hidden;background:var(--bg);
+  user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;touch-action:manipulation;}
+#sky{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;}
+#sky{z-index:6;}
+/* Snow gust: a canvas above the calendar, and a light veil over the calendar while the snow swirls */
+#storm{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:8;}
+#storm-veil{position:absolute;inset:0;z-index:7;pointer-events:none;background:rgba(12,10,16,.36);opacity:0;transition:opacity .5s ease;}
+#storm-veil.on{opacity:1;}
+#stage{position:absolute;left:50%;top:50%;width:1600px;height:2692px;transform:translate(-50%,-50%) scale(var(--k,1));transform-origin:50% 50%;
+  background:var(--bg) url(screen.jpg) 0 0/1600px 2692px no-repeat;}
+
+/* Doors, as in the reference recording: the tile swings away on its left edge and is gone,
+   leaving a dark niche of the same shape, where a small glowing gift box appears. */
+.door-cell{position:absolute;perspective:2600px;}
+.door-cell.is-open{z-index:4;}
+.niche{position:absolute;inset:0;overflow:hidden;display:flex;align-items:center;justify-content:center;
+  background:radial-gradient(circle at 50% 52%, #4E1833 0%, #2B1323 46%, #1B1019 100%);
+  -webkit-mask-position:center;mask-position:center;-webkit-mask-size:100% 100%;mask-size:100% 100%;-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;}
+.niche svg{width:var(--gs,120px);height:var(--gs,120px);opacity:0;transform:scale(.4);filter:drop-shadow(0 0 22px rgba(238,31,120,.8));}
+.door-cell.is-open .niche svg{animation:boxIn .42s cubic-bezier(.2,1.3,.4,1) .3s forwards;}
+@keyframes boxIn{to{opacity:1;transform:scale(1);}}
+@keyframes fadeTo1{to{opacity:1;}}
+
+.door-face{position:absolute;inset:0;width:100%;height:100%;border:0;padding:0;margin:0;cursor:pointer;border-radius:48px;
+  background:transparent center/100% 100% no-repeat;transform-origin:left center;
+  -webkit-tap-highlight-color:transparent;touch-action:manipulation;}
+.door-face:focus-visible{outline:6px solid var(--accent-hi);outline-offset:6px;}
+.door-cell.is-open .door-face{animation:doorSwing .44s cubic-bezier(.45,0,.75,1) forwards;pointer-events:none;}
+@keyframes doorSwing{0%{transform:rotateY(0deg);opacity:1;}78%{opacity:1;}100%{transform:rotateY(-97deg);opacity:0;}}
+.door-cell.knock .door-face{animation:knock 1s ease;}
+@keyframes knock{0%,100%{transform:rotateY(0);}30%{transform:rotateY(-14deg);}55%{transform:rotateY(4deg);}75%{transform:rotateY(-6deg);}}
+
+/* Reveal, as in the reference recording: the screen dims, the pink card fades up in the centre and the
+   prize picture rises out of it; then sparkles twinkle, rings breathe and a shine crosses the picture. No confetti. */
+.overlay{position:absolute;inset:0;z-index:10;display:flex;align-items:center;justify-content:center;}
+.overlay.prep{visibility:hidden;pointer-events:none;}
+.overlay-dim{position:absolute;inset:0;background:rgba(12,10,16,.64);opacity:0;}
+.overlay.show .overlay-dim{animation:fadeTo1 .35s ease forwards;}
+.card-wrap{position:relative;flex:none;transform:scale(var(--ck,1));}
+/* Gift card, built to the "Gift Card.svg" artboard (732 x 936): pink card, thin inner line,
+   the prize picture overlapping the top edge, headline, prize text, white pill button. */
+.card{position:relative;width:732px;height:936px;font-family:var(--font-body);opacity:0;transform:translateY(30px) scale(.94);}
+.card::before{content:"";position:absolute;left:0;right:0;top:102px;bottom:0;border-radius:51px;background:var(--card);box-shadow:0 40px 90px rgba(0,0,0,.55);}
+.card::after{content:"";position:absolute;left:42px;right:42px;top:145px;bottom:41px;border:2px solid var(--card-line);border-radius:44px;pointer-events:none;}
+.overlay.show .card{animation:cardIn .42s cubic-bezier(.2,.8,.3,1) forwards;}
+@keyframes cardIn{to{opacity:1;transform:none;}}
+.card-fx{position:absolute;left:0;right:0;top:102px;bottom:0;border-radius:51px;overflow:hidden;pointer-events:none;}
+.ring{position:absolute;left:50%;top:170px;width:var(--d);height:var(--d);margin:calc(var(--d) / -2) 0 0 calc(var(--d) / -2);border-radius:50%;border:1.5px solid rgba(255,255,255,.3);opacity:0;}
+.overlay.show .ring{animation:ringIn .8s ease .55s forwards, ringBreathe 3.8s ease-in-out 1.35s infinite alternate;}
+.overlay.show .ring + .ring{animation-delay:.75s, 1.55s;}
+@keyframes ringIn{from{opacity:0;transform:scale(.7);}to{opacity:.55;transform:scale(1);}}
+@keyframes ringBreathe{from{opacity:.55;transform:scale(1);}to{opacity:.2;transform:scale(1.07);}}
+.spark{position:absolute;width:var(--z);height:var(--z);background:#fff;opacity:0;clip-path:polygon(50% 0, 60% 40%, 100% 50%, 60% 60%, 50% 100%, 40% 60%, 0 50%, 40% 40%);}
+.spark.dot{clip-path:none;border-radius:50%;}
+.overlay.show .spark{animation:twinkle 2.6s ease-in-out infinite;}
+@keyframes twinkle{0%,100%{opacity:.12;transform:scale(.5) rotate(0deg);}50%{opacity:1;transform:scale(1) rotate(45deg);}}
+.gift-stage{position:absolute;left:66px;top:0;width:600px;height:545px;z-index:1;}
+.card,.gift-pop,.gift-float{will-change:transform,opacity;}
+.gift-pop{position:absolute;inset:0;opacity:0;transform:translateY(130px) scale(.5) rotate(-9deg);}
+.overlay.show .gift-pop{animation:giftRise .64s cubic-bezier(.2,1.25,.4,1) .16s forwards;}
+@keyframes giftRise{0%{opacity:0;transform:translateY(130px) scale(.5) rotate(-9deg);}45%{opacity:1;}100%{opacity:1;transform:none;}}
+.gift-float{position:absolute;inset:0;animation:float 3.4s ease-in-out 1s infinite;}
+@keyframes float{0%,100%{transform:translateY(0) rotate(0deg);}50%{transform:translateY(-8px) rotate(.8deg);}}
+.gift-img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;filter:drop-shadow(0 22px 28px rgba(70,0,35,.38));}
+/* A band of light that crosses the picture; masked by the picture itself so it never spills outside its shape. */
+.gift-shine{position:absolute;inset:0;pointer-events:none;
+  -webkit-mask-position:center;mask-position:center;-webkit-mask-size:contain;mask-size:contain;-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;
+  background:linear-gradient(105deg, rgba(255,255,255,0) 42%, rgba(255,255,255,.85) 50%, rgba(255,255,255,0) 58%) no-repeat;background-size:260% 100%;background-position:130% 0;}
+.overlay.show .gift-shine{animation:shine 3.8s ease-in-out 1.1s infinite;}
+@keyframes shine{0%{background-position:130% 0;}36%,100%{background-position:-30% 0;}}
+.card-text{position:absolute;left:64px;right:64px;top:556px;height:192px;z-index:1;display:flex;flex-direction:column;align-items:center;gap:12px;text-align:center;}
+.card-title{margin:0;font-weight:700;font-size:42px;line-height:1.2;color:#fff;}
+.card-desc{margin:0;font-weight:600;font-size:31px;line-height:1.2;color:#fff;text-wrap:balance;overflow-wrap:anywhere;}
+.card-sub{margin:0;font-weight:500;font-size:28px;line-height:1.2;color:#fff;}
+.card-name{margin:0;font-weight:700;font-size:38px;line-height:1.2;color:#fff;text-wrap:balance;overflow-wrap:anywhere;}
+.close-btn{position:absolute;left:226px;top:760px;width:280px;height:82px;z-index:1;border:0;border-radius:41px;background:#fff;color:#111;font-size:34px;font-weight:600;cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent;}
+.close-btn:active{transform:scale(.97);}
+.close-btn:focus-visible{outline:4px solid #fff;outline-offset:5px;}
+/* Same card without a picture, for staff notices */
+.card.note{height:auto;box-sizing:border-box;padding:206px 84px 100px;display:flex;flex-direction:column;align-items:center;gap:18px;text-align:center;}
+.card.note .card-title,.card.note .card-desc{position:relative;z-index:1;}
+.card.note .card-desc{font-size:28px;line-height:1.35;font-weight:500;}
+.card.note .close-btn{position:relative;left:auto;top:auto;margin-top:26px;flex:none;}
+
+.k-tools{position:absolute;right:max(14px, env(safe-area-inset-right, 0px));top:max(14px, env(safe-area-inset-top, 0px));z-index:30;display:flex;gap:8px;}
+.k-tools button{min-height:44px;padding:0 16px;border-radius:22px;border:1px solid rgba(246,169,192,.35);background:rgba(28,28,36,.6);color:var(--faint);font-size:14px;cursor:pointer;}
+.k-tools button:hover{color:var(--cream);border-color:var(--accent);}
+.k-status{position:absolute;left:50%;bottom:max(14px, env(safe-area-inset-bottom, 0px));transform:translateX(-50%);z-index:30;max-width:calc(100% - 32px);box-sizing:border-box;padding:10px 18px;border-radius:12px;background:rgba(28,28,36,.92);border:1px solid var(--danger);color:var(--cream);font-size:14px;text-align:center;}
+
+/* ================= ADMIN ================= */
+#admin{min-height:100vh;box-sizing:border-box;padding-block:28px 64px;padding-left:max(16px, env(safe-area-inset-left, 0px));padding-right:max(16px, env(safe-area-inset-right, 0px));
+  background:linear-gradient(180deg, #35333F 0, var(--bg) 360px);}
+.a-wrap{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:24px;}
+.a-head{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:16px;}
+.a-head h1{margin:4px 0 0;font-family:var(--font-display);font-size:34px;font-weight:700;line-height:1.15;text-wrap:balance;}
+.a-eyebrow{margin:0;font-size:13px;letter-spacing:.24em;color:var(--accent);font-weight:600;}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;padding:0 18px;border-radius:12px;border:1px solid var(--line);background:var(--surface-2);color:var(--cream);font-size:15px;font-weight:500;cursor:pointer;text-decoration:none;}
+.btn:hover{border-color:var(--accent);}
+.btn:focus-visible{outline:3px solid var(--accent-hi);outline-offset:2px;}
+.btn.primary{background:var(--accent);color:var(--ink);border-color:var(--accent);font-weight:700;}
+.btn.primary:hover{background:var(--accent-hi);}
+.btn.ghost{background:transparent;}
+.btn.danger{color:var(--danger);border-color:rgba(255,154,154,.4);background:transparent;}
+.btn.danger.armed{background:#8A1838;color:#fff;border-color:var(--danger);}
+.btn[disabled]{opacity:.5;cursor:not-allowed;}
+.stats{display:grid;grid-template-columns:repeat(auto-fit, minmax(min(180px,100%),1fr));gap:12px;}
+.stat{padding:16px 18px;border-radius:14px;background:var(--surface);border:1px solid var(--line);}
+.stat p{margin:0;font-size:13px;color:var(--muted);}
+.stat strong{display:block;margin-top:4px;font-family:var(--font-display);font-size:32px;font-weight:700;color:var(--accent-hi);font-variant-numeric:tabular-nums;}
+.sheet-box{display:flex;flex-wrap:wrap;gap:14px 20px;align-items:center;justify-content:space-between;padding:18px 22px;margin-bottom:24px;border-radius:18px;background:var(--surface);border:1px solid var(--line);}
+.sheet-text{flex:1 1 320px;min-width:0;}
+.sheet-box h2{margin:0;font-size:19px;font-weight:600;}
+.sheet-box p{margin:5px 0 0;font-size:14px;line-height:1.45;color:var(--muted);}
+.sheet-box p.err{color:var(--danger);}
+.sheet-actions{display:flex;flex-wrap:wrap;gap:10px;}
+select.btn{font-family:inherit;padding-right:12px;}
+.a-grid{display:flex;flex-wrap:wrap;gap:24px;align-items:flex-start;}
+.a-form{flex:1 1 340px;max-width:420px;min-width:0;padding:22px;border-radius:18px;background:var(--surface);border:1px solid var(--line);display:flex;flex-direction:column;gap:16px;box-sizing:border-box;}
+.a-list{flex:999 1 520px;min-width:0;display:flex;flex-direction:column;gap:12px;}
+.a-form h2,.a-list h2,.a-log h2{margin:0;font-size:19px;font-weight:600;}
+.field{display:flex;flex-direction:column;gap:6px;}
+.field label{font-size:14px;color:var(--muted);}
+.field input[type=text],.field input[type=number],.field textarea{box-sizing:border-box;width:100%;padding:11px 12px;border-radius:10px;border:1px solid var(--line);background:var(--bg-deep);color:var(--cream);font:inherit;font-size:16px;}
+.field textarea{min-height:84px;resize:vertical;}
+.field input:focus-visible,.field textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+.field .hint{font-size:12.5px;color:var(--faint);}
+.img-pick{display:flex;gap:14px;align-items:center;}
+.img-box{width:96px;height:96px;flex:none;border-radius:12px;border:1px dashed var(--line);background:var(--bg-deep);display:flex;align-items:center;justify-content:center;overflow:hidden;color:var(--faint);}
+.img-box img{width:100%;height:100%;object-fit:contain;}
+.file-input{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;}
+.form-actions{display:flex;flex-wrap:wrap;gap:10px;}
+.form-msg{margin:0;font-size:14px;min-height:20px;}
+.form-msg.err{color:var(--danger);} .form-msg.ok{color:var(--ok);}
+#g-list{display:flex;flex-direction:column;gap:12px;}
+.gift-row{display:flex;gap:16px;align-items:center;padding:14px;border-radius:16px;background:var(--surface);border:1px solid var(--line);}
+.gift-row.off{opacity:.62;}
+.gift-row.editing{border-color:var(--accent);}
+.gift-thumb{width:72px;height:72px;flex:none;border-radius:12px;background:var(--bg-deep);display:flex;align-items:center;justify-content:center;overflow:hidden;color:var(--accent);}
+.gift-thumb img{width:100%;height:100%;object-fit:contain;}
+.gift-main{flex:1 1 auto;min-width:0;}
+.gift-main h3{margin:0;font-size:17px;font-weight:600;overflow-wrap:anywhere;}
+.gift-main p{margin:3px 0 0;font-size:14px;color:var(--muted);overflow-wrap:anywhere;}
+.stock{display:flex;align-items:center;gap:10px;margin-top:8px;font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums;flex-wrap:wrap;}
+.bar{width:120px;height:6px;border-radius:3px;background:rgba(255,241,230,.14);overflow:hidden;}
+.bar i{display:block;height:100%;background:var(--accent);}
+.pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;}
+.pill.out{background:rgba(255,154,154,.16);color:var(--danger);}
+.pill.paused{background:rgba(255,241,230,.12);color:var(--muted);}
+.gift-actions{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;align-items:center;}
+.switch{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);cursor:pointer;min-height:44px;}
+.switch input{width:20px;height:20px;accent-color:#F6A9C0;}
+@media (max-width:640px){.gift-row{flex-wrap:wrap;}.gift-actions{width:100%;justify-content:flex-start;}}
+.empty{padding:28px;border-radius:16px;border:1px dashed var(--line);color:var(--muted);text-align:center;line-height:1.5;}
+.a-log{padding:22px;border-radius:18px;background:var(--surface);border:1px solid var(--line);display:flex;flex-direction:column;gap:14px;}
+.log-head{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;}
+.table-wrap{overflow-x:auto;}
+table{width:100%;border-collapse:collapse;font-size:14px;}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid rgba(246,169,192,.14);}
+th{font-weight:600;color:var(--muted);font-size:12.5px;letter-spacing:.04em;}
+td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
+.lock{max-width:560px;margin:80px auto;padding:28px;border-radius:18px;background:var(--surface);border:1px solid var(--line);text-align:center;line-height:1.55;}
+.toast{position:fixed;left:50%;bottom:max(20px, env(safe-area-inset-bottom, 0px));transform:translateX(-50%);z-index:50;padding:12px 20px;border-radius:12px;background:var(--accent);color:var(--ink);font-weight:600;box-shadow:0 10px 24px rgba(0,0,0,.4);}
+
+@media (prefers-reduced-motion: reduce){
+  .gift-float,.overlay.show .gift-shine,.overlay.show .spark,.overlay.show .ring{animation:none !important;}
+  .overlay.show .card,.overlay.show .gift-pop{animation:fadeTo1 .3s ease forwards;transform:none;}
+  .ring{opacity:.4;} .spark{opacity:.8;}
+}
+</style>
+
+<div id="kiosk" aria-label="Ադվենտ օրացույց">
+  <div id="stage" role="group" aria-label="Հպեք ցանկացած պատուհան և ստացեք Ձեր նվերը"></div>
+  <canvas id="sky" aria-hidden="true"></canvas>
+  <div id="storm-veil" aria-hidden="true"></div>
+  <canvas id="storm" aria-hidden="true"></canvas>
+
+  <div id="reveal" class="overlay" hidden role="dialog" aria-modal="true" aria-labelledby="rv-title" aria-describedby="rv-name">
+    <div class="overlay-dim"></div>
+    <div class="card-wrap">
+      <div class="card" id="rv-card">
+        <div class="gift-stage" id="rv-stage"></div>
+        <div class="card-text">
+          <h2 class="card-title" id="rv-title">Շնորհավորում ենք</h2>
+          <p class="card-sub">Դուք ստանում եք նվեր</p>
+          <p class="card-name" id="rv-name"></p>
+        </div>
+        <button type="button" class="close-btn" data-close>ՓԱԿԵԼ</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="notice" class="overlay" hidden role="alertdialog" aria-modal="true" aria-labelledby="nt-title" aria-describedby="nt-text">
+    <div class="overlay-dim"></div>
+    <div class="card-wrap">
+      <div class="card note">
+        <h2 class="card-title" id="nt-title"></h2>
+        <p class="card-desc" id="nt-text"></p>
+        <button type="button" class="close-btn" data-close>ՓԱԿԵԼ</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="k-tools">
+    <button type="button" id="fs-btn">Ամբողջ էկրան</button>
+  </div>
+  <div class="k-status" id="k-status" hidden></div>
+</div>
+
+<main id="admin" hidden>
+  <div class="a-wrap" id="a-wrap">
+    <header class="a-head">
+      <div>
+        <p class="a-eyebrow">ԱԴՎԵՆՏ ՕՐԱՑՈՒՅՑ · ԿԱՌԱՎԱՐՈՒՄ</p>
+        <h1>Նվերների ցանկ</h1>
+      </div>
+      <a class="btn primary" href="#kiosk" id="open-kiosk">Բացել օրացույցը</a>
+    </header>
+
+    <div class="lock" id="a-lock" hidden></div>
+
+    <div id="a-body" hidden>
+      <div class="stats" style="margin-bottom:24px">
+        <div class="stat"><p>Ակտիվ նվերների տեսակ</p><strong id="st-types">0</strong></div>
+        <div class="stat"><p>Մնացել է տալու</p><strong id="st-left">0</strong></div>
+        <div class="stat"><p>Արդեն տրվել է</p><strong id="st-won">0</strong></div>
+      </div>
+
+      <section class="sheet-box" aria-labelledby="sheet-title">
+        <div class="sheet-text">
+          <h2 id="sheet-title">Նվերների ցանկը՝ Google Sheet-ից</h2>
+          <p id="sheet-status" role="status">Բեռնվում է…</p>
+        </div>
+        <div class="sheet-actions">
+          <a class="btn ghost" id="sheet-link" target="_blank" rel="noopener">Բացել աղյուսակը</a>
+          <button type="button" class="btn" id="sheet-sync">Թարմացնել հիմա</button>
+        </div>
+      </section>
+
+      <section class="sheet-box" aria-labelledby="fx-title">
+        <div class="sheet-text">
+          <h2 id="fx-title">Պատուհանի բացման էֆեկտ</h2>
+          <p>Ինչ է դուրս գալիս պատուհանից՝ մինչև նվերի քարտի հայտնվելը։</p>
+        </div>
+        <div class="sheet-actions">
+          <select id="fx-select" class="btn" aria-labelledby="fx-title">
+            <option value="vortex">Ձնե մրրիկ</option>
+            <option value="galaxy">Ձյան պտույտ (գալակտիկա)</option>
+            <option value="tornado">Ձյան տորնադո</option>
+            <option value="ribbon">Ձյան կայծ և օղակ</option>
+            <option value="swirl">Ձնապտույտ</option>
+          </select>
+        </div>
+      </section>
+
+      <div class="a-grid">
+        <form class="a-form" id="g-form" novalidate>
+          <h2 id="f-title">Նոր նվեր (աղյուսակից դուրս)</h2>
+          <div class="field">
+            <label for="g-name">Անվանում</label>
+            <input type="text" id="g-name" maxlength="80" autocomplete="off" required>
+            <span class="hint">Ցուցադրվում է քարտի վրա՝ «Դուք ստանում եք նվեր» տողի տակ։</span>
+          </div>
+          <div class="field">
+            <label for="g-qty">Քանակ</label>
+            <input type="number" id="g-qty" min="0" step="1" inputmode="numeric" value="1">
+            <span class="hint" id="g-qty-hint">Քանի հատ կարելի է տալ։ Ավարտվելուց հետո նվերն այլևս չի ընկնում։</span>
+          </div>
+          <div class="field">
+            <span id="g-img-label" style="font-size:14px;color:var(--muted)">Նկար</span>
+            <div class="img-pick">
+              <div class="img-box" id="g-preview">Նկար չկա</div>
+              <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-start">
+                <input class="file-input" type="file" id="g-img" accept="image/png,image/jpeg,image/webp" aria-labelledby="g-img-label">
+                <label for="g-img" class="btn" role="button" tabindex="0" id="g-img-btn">Ընտրել նկար</label>
+                <button type="button" class="btn ghost" id="g-img-clear" hidden>Հեռացնել նկարը</button>
+              </div>
+            </div>
+            <span class="hint">PNG թափանցիկ ֆոնով լավագույնն է։ Նկարը կարելի է տալ նաև աղյուսակի «Photo link» սյունակում՝ Google Drive-ի հղումով։</span>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="btn primary" id="f-submit">Ավելացնել</button>
+            <button type="button" class="btn ghost" id="f-cancel" hidden>Չեղարկել</button>
+          </div>
+          <p class="form-msg" id="f-msg" role="status"></p>
+        </form>
+
+        <section class="a-list" aria-labelledby="list-title">
+          <h2 id="list-title">Նվերներ</h2>
+          <div id="g-list"></div>
+        </section>
+      </div>
+
+      <section class="a-log" style="margin-top:24px" aria-labelledby="log-title">
+        <div class="log-head">
+          <h2 id="log-title">Վերջին տրված նվերները</h2>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button type="button" class="btn danger" id="clear-log">Մաքրել պատմությունը</button>
+            <button type="button" class="btn danger" id="reset-all">Զրոյացնել թեստից հետո</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">Ժամ</th><th scope="col">Պատուհան</th><th scope="col">Նվեր</th></tr></thead>
+            <tbody id="log-body"></tbody>
+          </table>
+        </div>
+        <p class="hint" id="log-note" style="margin:0;font-size:13px;color:var(--faint)"></p>
+      </section>
+    </div>
+  </div>
+</main>
+
+<script>
+(function () {
+  'use strict';
+  var $ = function (s, r) { return (r || document).querySelector(s); };
+  var el = function (tag, cls, text) { var n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+  var reduceMotion = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* ---------------- shared state ---------------- */
+  var S = { db: null, assets: null, user: null, canEdit: false, ready: false, capsResolved: false, gifts: [], draws: [], mode: 'idle', mcp: null, sync: null, syncing: false, syncAgain: false, wonFloor: {}, photoFail: {}, importing: false, effect: 'vortex' };
+  var remaining = function (g) { return Math.max(0, (Number(g.quantity) || 0) - (Number(g.won) || 0)); };
+  var imgUrl = function (id) { return id ? '/_blob/' + id : ''; };
+  // A gift can be drawn when it is switched on and still listed in the Google Sheet.
+  var isLive = function (g) { return g.active !== false && g.inSheet !== false; };
+
+  /* ---------------- Google Sheet = the gift list, and the place the results are written back ---------------- */
+  // Read: gift name + quantity (the TOTAL to give). Written by this page: "Won" (given so far) and "Remaining" (= quantity - won).
+  var SHEET = { server: 'Google Sheets', id: '1sGJgYqhSq1eM0i0OyR84XBu2SmOeMz0Mrl9s27C8al0', range: 'A:Z', wonHead: 'Won', remHead: 'Remaining' };
+  SHEET.url = 'https://docs.google.com/spreadsheets/d/' + SHEET.id + '/edit';
+  var normKey = function (v) { return String(v || '').trim().replace(/\s+/g, ' ').toLowerCase(); };
+  function hashId(key) { var h = 0x811c9dc5; for (var i = 0; i < key.length; i++) { h ^= key.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return 's' + h.toString(16) + '-' + key.length; }
+  function colLetter(i) { var out = ''; i++; while (i > 0) { var m = (i - 1) % 26; out = String.fromCharCode(65 + m) + out; i = (i - m - 1) / 26; } return out; }
+  var cellText = function (row, i) { return String((row && row[i] != null) ? row[i] : '').trim(); };
+
+  // get_values answers {range: "Sheet1!A1:Z1000", values: [[...], ...]} with displayed strings; an empty row is [].
+  function readSheet(res) {
+    var pl = res ? res.payload : null;
+    if (typeof pl === 'string') { try { pl = JSON.parse(pl); } catch (e) { pl = null; } }
+    if (pl && pl.content && typeof pl.content === 'object' && !Array.isArray(pl.content)) pl = pl.content;
+    if (!pl || typeof pl !== 'object') throw { code: 'bad_sheet' };
+    var table = Array.isArray(pl.values) ? pl.values : [];
+    if (!table.length) throw { code: 'bad_sheet' };
+    var tab = (typeof pl.range === 'string' && pl.range.indexOf('!') > 0) ? pl.range.slice(0, pl.range.lastIndexOf('!') + 1) : '';
+    var head = (table[0] || []).map(function (c) { return String(c == null ? '' : c).trim().toLowerCase(); });
+    var hasHeader = !/^\d+$/.test(cellText(table[0], 1));
+    var cName = 0, cQty = 1, cWon = -1, cRem = -1, cPhoto = -1;
+    if (hasHeader) {
+      var n = -1, k = -1;
+      head.forEach(function (h, i) {
+        if (cPhoto < 0 && /photo|image|picture|img|фото|картин|նկար/.test(h)) cPhoto = i;
+        else if (cWon < 0 && /^won$|won\b|выдан|տրված|տրվել/.test(h)) cWon = i;
+        else if (cRem < 0 && /remain|остат|մնաց/.test(h)) cRem = i;
+        else if (k < 0 && /quant|qty|քանակ|кол/.test(h)) k = i;
+        else if (n < 0 && /name|gift|անուն|նվեր|назв|подар/.test(h)) n = i;
+      });
+      if (n >= 0 && k >= 0) { cName = n; cQty = k; }
+    }
+    // Columns for the results: the ones already headed Won / Remaining, else the first free columns after the headers.
+    var used = Math.max(head.length, cName + 1, cQty + 1);
+    if (cWon < 0) { cWon = used; used++; }
+    if (cRem < 0) { cRem = Math.max(used, cWon + 1); }
+    var lines = [], rows = [], idx = {};
+    for (var r = hasHeader ? 1 : 0; r < table.length; r++) {
+      var name = cellText(table[r], cName).replace(/\s+/g, ' ');
+      var line = { rowNum: r + 1, key: null, qty: 0, first: false, won: cellText(table[r], cWon), rem: cellText(table[r], cRem) };
+      if (name) {
+        var qty = parseInt(cellText(table[r], cQty).replace(/[^\d]/g, ''), 10);
+        if (!isFinite(qty) || qty < 0) qty = 0;
+        line.key = normKey(name); line.qty = qty;
+        var photo = cPhoto >= 0 ? cellText(table[r], cPhoto) : '';
+        if (line.key in idx) { rows[idx[line.key]].qty += qty; if (!rows[idx[line.key]].photo) rows[idx[line.key]].photo = photo; }
+        else { line.first = true; idx[line.key] = rows.length; rows.push({ key: line.key, name: name, qty: qty, photo: photo }); }
+      }
+      lines.push(line);
+    }
+    return { rows: rows, lines: lines, tab: tab, hasHeader: hasHeader, cQty: cQty, cWon: cWon, cRem: cRem,
+             headWon: cellText(table[0], cWon), headRem: cellText(table[0], cRem) };
+  }
+
+  // Sheet rows -> gift documents. Quantity in the sheet is the TOTAL to give; the calendar counts what was given (won).
+  async function applySheetRows(rows) {
+    var byKey = {}, seen = {}, writes = [];
+    S.gifts.forEach(function (g) { var k = normKey(g.name); if (!(k in byKey)) byKey[k] = g; });
+    rows.forEach(function (row, i) {
+      seen[row.key] = true;
+      var g = byKey[row.key];
+      if (g) {
+        var patch = {};
+        if ((Number(g.quantity) || 0) !== row.qty) patch.quantity = row.qty;
+        if (g.inSheet !== true) patch.inSheet = true;
+        if (g.source !== 'sheet') patch.source = 'sheet';
+        if (g.name !== row.name) patch.name = row.name;
+        if (Object.keys(patch).length) writes.push(S.db.doc('gifts/' + g.id).update(patch));
+      } else {
+        // Deterministic id, so the kiosk and an open admin page syncing at once cannot create the gift twice.
+        var ref = S.db.doc('gifts/' + hashId(row.key));
+        writes.push(ref.get().then(function (snap) {
+          return snap.exists
+            ? ref.update({ name: row.name, quantity: row.qty, inSheet: true, source: 'sheet' })
+            : ref.set({ name: row.name, quantity: row.qty, won: 0, active: true, inSheet: true, source: 'sheet', imageId: null, createdAt: Date.now() + i });
+        }));
+      }
+    });
+    // A gift deleted from the sheet is kept (with its history) but no longer drawn.
+    S.gifts.forEach(function (g) {
+      if (g.source === 'sheet' && g.inSheet !== false && !seen[normKey(g.name)]) writes.push(S.db.doc('gifts/' + g.id).update({ inSheet: false }));
+    });
+    await Promise.all(writes);
+  }
+
+  // Write "Won" and "Remaining" next to every gift row; only the cells whose shown value is out of date.
+  async function writeResults(sh) {
+    var wonBy = {};
+    S.gifts.forEach(function (g) { var k = normKey(g.name); if (!(k in wonBy)) wonBy[k] = Math.max(Number(g.won) || 0, S.wonFloor[g.id] || 0); });
+    var q = colLetter(sh.cQty), w = colLetter(sh.cWon), rm = colLetter(sh.cRem);
+    var wonCol = [], remCol = [], dirtyWon = false, dirtyRem = false;
+    if (sh.hasHeader) {
+      wonCol.push(SHEET.wonHead); remCol.push(SHEET.remHead);
+      if (sh.headWon !== SHEET.wonHead && !sh.headWon) dirtyWon = true;
+      if (sh.headRem !== SHEET.remHead && !sh.headRem) dirtyRem = true;
+      if (sh.headWon) wonCol[0] = null;          // keep a header the user already wrote
+      if (sh.headRem) remCol[0] = null;
+    }
+    sh.lines.forEach(function (ln) {
+      if (!ln.key) {                               // not a gift row: keep our two columns empty there
+        wonCol.push(''); remCol.push('');
+        if (ln.won) dirtyWon = true; if (ln.rem) dirtyRem = true;
+        return;
+      }
+      var won = ln.first ? (wonBy[ln.key] || 0) : 0;
+      wonCol.push(won); remCol.push('=' + q + ln.rowNum + '-' + w + ln.rowNum);
+      if (ln.won !== String(won)) dirtyWon = true;
+      // The Remaining cell is a formula; rewrite it only when it is missing or was overwritten.
+      if (ln.rem !== String(ln.qty - (parseInt(ln.won, 10) || 0))) dirtyRem = true;
+    });
+    var first = 1, last = wonCol.length;      // both columns start at row 1 (header row, or the first gift when there is none)
+    var put = function (letter, col) {
+      return S.mcp.callTool(SHEET.server, 'update_values', { spreadsheetId: SHEET.id, range: sh.tab + letter + first + ':' + letter + last, values: col.map(function (v) { return [v]; }) }, { cache: false });
+    };
+    if (dirtyWon) await put(w, wonCol);
+    if (dirtyRem) await put(rm, remCol);
+  }
+
+  /* ---------------- gift photos: a Google Drive link in the sheet's "Photo" column ---------------- */
+  // The page cannot show pictures from other sites, so it copies the Drive file into its own store once
+  // and remembers which file the copy came from (photoSrc); a changed link is copied again.
+  var DRIVE = { server: 'Google Drive', tool: 'download_file_content' };
+  function driveFileId(link) {
+    var v = String(link || '').trim();
+    var m = v.match(/\/d\/([A-Za-z0-9_-]{20,})/) || v.match(/[?&]id=([A-Za-z0-9_-]{20,})/) || v.match(/^([A-Za-z0-9_-]{25,})$/);
+    return m ? m[1] : null;
+  }
+  function sniffImage(b) {
+    if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E) return 'image/png';
+    if (b[0] === 0xFF && b[1] === 0xD8) return 'image/jpeg';
+    if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return 'image/gif';
+    if (b[0] === 0x52 && b[1] === 0x49 && b[8] === 0x57 && b[9] === 0x45) return 'image/webp';
+    return null;
+  }
+  async function fetchDriveImage(fileId) {
+    var res = await S.mcp.callTool(DRIVE.server, DRIVE.tool, { fileId: fileId }, { cache: false });
+    var pl = res ? res.payload : null;
+    if (typeof pl === 'string') { try { pl = JSON.parse(pl); } catch (e) { pl = null; } }
+    var b64 = (pl && typeof pl === 'object' && typeof pl.content === 'string') ? pl.content : null;
+    if (!b64) throw { code: 'bad_photo' };
+    var bin; try { bin = atob(b64.replace(/\s+/g, '')); } catch (e) { throw { code: 'bad_photo' }; }
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    var type = sniffImage(bytes);
+    if (!type) throw { code: 'not_image' };
+    return new Blob([bytes], { type: type });
+  }
+  async function importPhotos(rows, force) {
+    if (S.importing || !S.assets || !S.mcp || !S.db) return;
+    var byKey = {}, todo = [], waiting = false, wanted = {};
+    S.gifts.forEach(function (g) { var k = normKey(g.name); if (!(k in byKey)) byKey[k] = g; });
+    rows.forEach(function (row) {
+      var fid = driveFileId(row.photo); if (!fid) return;
+      wanted[fid] = true;
+      var g = byKey[row.key];
+      if (!g) { waiting = true; return; }                       // gift created a moment ago, not in the snapshot yet
+      if (g.photoSrc === fid && g.imageId) return;              // already copied from this very file
+      var f = S.photoFail[fid];
+      if (f && !force && Date.now() - f.at < 60000) return;     // a failed file is retried after a minute or by the button
+      todo.push({ g: g, fid: fid });
+    });
+    Object.keys(S.photoFail).forEach(function (fid) { if (!wanted[fid]) delete S.photoFail[fid]; });
+    if (waiting && !S.photoRetry) S.photoRetry = setTimeout(function () { S.photoRetry = 0; syncFromSheet('manual'); }, 1500);
+    if (!todo.length) { renderSheetStatus(); return; }
+    S.importing = true; renderSheetStatus();
+    try {
+      for (var i = 0; i < todo.length && i < 4; i++) {          // a few per pass keeps the kiosk light; the rest follow
+        for (var w = 0; w < 40 && S.mode === 'opening'; w++) await sleep(250);   // never resize a photo during an opening
+        var t = todo[i];
+        try {
+          var blob = await shrinkImage(await fetchDriveImage(t.fid));
+          var up = await S.assets.upload(blob);
+          await S.db.doc('gifts/' + t.g.id).update({ imageId: up.id, photoSrc: t.fid });
+          if (t.g.imageId && t.g.imageId !== up.id) S.assets.delete(t.g.imageId).catch(function () {});
+          delete S.photoFail[t.fid];
+        } catch (e) { S.photoFail[t.fid] = { at: Date.now(), code: (e && e.code) || 'upstream_error', name: t.g.name }; }
+      }
+    } finally { S.importing = false; renderSheetStatus(); }
+    if (todo.length > 4) setTimeout(function () { syncFromSheet('manual'); }, 800);
+  }
+  var PHOTO_ERR = {
+    server_not_connected: 'սերվերում Google-ի ծառայողական հաշիվը կարգավորված չէ։',
+    needs_reauth: 'Google Drive-ի մուտքը ժամկետանց է․ վերամիացրեք այն claude.ai → Settings → Connectors բաժնում։',
+    not_in_manifest: 'Google Drive-ի թույլտվությունը այս էջի համար տրված չէ․ սեղմեք «Թարմացնել հիմա» և թույլատրեք։',
+    approval_required: 'Google Drive-ի թույլտվությունը այս էջի համար տրված չէ․ սեղմեք «Թարմացնել հիմա» և թույլատրեք։',
+    consent_required: 'Google Drive-ի թույլտվությունը այս էջի համար տրված չէ․ սեղմեք «Թարմացնել հիմա» և թույլատրեք։',
+    tool_error: 'ֆայլը հասանելի չէ այս Google հաշվին․ Drive-ում բացեք հասանելիությունը՝ «Բոլորը, ով ունի հղումը»։',
+    not_image: 'հղումը նկարի ֆայլ չէ (պետք է PNG, JPG կամ WEBP)։',
+    bad_photo: 'ֆայլը չհաջողվեց կարդալ որպես նկար։',
+    too_large: 'ֆայլը չափազանց մեծ է։',
+    unsupported_type: 'նկարի ձևաչափը չի աջակցվում (պետք է PNG, JPG կամ WEBP)։'
+  };
+  function photoNote() {
+    var fids = Object.keys(S.photoFail);
+    if (S.importing) return { text: ' Նկարները բեռնվում են Google Drive-ից…', err: false };
+    if (!fids.length) return null;
+    var first = S.photoFail[fids[0]];
+    var names = fids.map(function (f) { return '«' + S.photoFail[f].name + '»'; }).join(', ');
+    return { text: ' Նկարը չբեռնվեց (' + names + ')՝ ' + (PHOTO_ERR[first.code] || 'փորձեք մի փոքր ուշ։'), err: true };
+  }
+
+  function fetchSheet() {
+    return S.mcp.callTool(SHEET.server, 'get_values', { spreadsheetId: SHEET.id, range: SHEET.range }, { cache: false });
+  }
+  // reason: 'load' | 'timer' | 'close' (throttled) or 'win' | 'manual' (always runs, queued behind a pass in flight)
+  async function syncFromSheet(reason) {
+    if (!S.mcp || !S.db || !(S.canEdit || S.canSync) || !S.ready) return;
+    var must = reason === 'manual' || reason === 'win';
+    if (S.mode === 'opening' || (S.mode === 'reveal' && performance.now() - (S.revealAt || 0) < 2200)) {
+      if (!S.syncDefer) S.syncDefer = setTimeout(function () { S.syncDefer = 0; syncFromSheet(must ? 'manual' : reason); }, 2500);
+      return;
+    }
+    if (S.syncing) { if (must) S.syncAgain = true; return; }
+    var now = Date.now();
+    if (!must && now - (S.syncStarted || 0) < 4000) return;
+    S.syncing = true; S.syncStarted = now; renderSheetStatus();
+    try {
+      var res;
+      try { res = await fetchSheet(); }
+      catch (e) {
+        if (!(e && e.retryable)) throw e;                    // one unattended retry, reads only
+        await sleep(Math.min(e.retryAfterMs || 2000, 10000) + Math.random() * 500);
+        res = await fetchSheet();
+      }
+      var sh = readSheet(res);
+      await applySheetRows(sh.rows);
+      var writeErr = null;
+      // The write is absolute (the full column), so a failed one is simply repeated by the next pass.
+      try { await writeResults(sh); } catch (e) { writeErr = (e && e.code) || 'upstream_error'; }
+      S.sync = { ok: true, at: Date.now(), count: sh.rows.length, writeErr: writeErr };
+      importPhotos(sh.rows, reason === 'manual');        // in the background; never holds up a draw
+    } catch (e) {
+      S.sync = { ok: false, at: Date.now(), code: (e && e.code) || 'upstream_error' };
+    } finally {
+      S.syncing = false; renderSheetStatus(); kioskStatus();
+      if (S.syncAgain) { S.syncAgain = false; setTimeout(function () { syncFromSheet('manual'); }, 60); }
+    }
+  }
+
+  var SYNC_ERR = {
+    server_not_connected: 'Սերվերում Google-ի ծառայողական հաշիվը կարգավորված չէ (GOOGLE_SERVICE_ACCOUNT_JSON)։',
+    selection_required: 'Այս հաշվում մի քանի Google Sheets կա։ Ընտրեք մեկը claude.ai-ի հարցման մեջ և սեղմեք «Թարմացնել հիմա»։',
+    needs_reauth: 'Google Sheets-ի մուտքը ժամկետանց է։ Վերամիացրեք այն claude.ai → Settings → Connectors բաժնում։',
+    not_in_manifest: 'Google Sheets-ի թույլտվությունը այս էջի համար տրված չէ։ Սեղմեք «Թարմացնել հիմա» և թույլատրեք։',
+    approval_required: 'Google Sheets-ի թույլտվությունը այս էջի համար տրված չէ։ Սեղմեք «Թարմացնել հիմա» և թույլատրեք։',
+    consent_required: 'Google Sheets-ի թույլտվությունը այս էջի համար տրված չէ։ Սեղմեք «Թարմացնել հիմա» և թույլատրեք։',
+    blocked_by_policy: 'Կազմակերպության կանոնները թույլ չեն տալիս այս էջին կարդալ Google Sheets-ը։',
+    tool_error: 'Աղյուսակը չբացվեց։ Կիսվեք աղյուսակով ծառայողական հաշվի email-ի հետ՝ «Խմբագիր» իրավունքով։',
+    bad_sheet: 'Աղյուսակի ձևաչափը չհաջողվեց կարդալ։ Առաջին սյունը՝ նվերի անուն, երկրորդը՝ քանակ։',
+    not_granted: 'Այս դիտման մեջ Google Sheets-ը հասանելի չէ։',
+    capability_disabled: 'Այս դիտման մեջ Google Sheets-ը հասանելի չէ։'
+  };
+  function renderSheetStatus() {
+    var el2 = $('#sheet-status'); if (!el2) return;
+    var msg, err = false, sy = S.sync;
+    if (!S.capsResolved) msg = 'Բեռնվում է…';
+    else if (!S.mcp) { msg = 'Google Sheets կապը այս դիտման մեջ հասանելի չէ․ ցանկը աղյուսակից չի թարմանում։'; err = true; }
+    else if (S.syncing) msg = 'Կարդում եմ աղյուսակը…';
+    else if (!sy) msg = 'Դեռ չի կարդացվել։';
+    else if (sy.ok) msg = 'Վերջին թարմացումը՝ ' + new Date(sy.at).toLocaleTimeString('hy-AM', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) + ' · աղյուսակում ' + sy.count + ' նվեր։ Կարդացվում և լրացվում է ամեն խաղարկությունից հետո։';
+    else { err = true; msg = SYNC_ERR[sy.code] || 'Այս անգամ չհաջողվեց կարդալ աղյուսակը։ Հաջորդ փորձը կլինի ավտոմատ։'; }
+    if (sy && sy.ok && sy.writeErr && !S.syncing) { err = true; msg += ' «Won» և «Remaining» սյունակները չգրվեցին․ այս Google հաշվին պետք է աղյուսակը խմբագրելու իրավունք։'; }
+    var pn = (sy && sy.ok) ? photoNote() : null;
+    if (pn) { msg += pn.text; if (pn.err) err = true; }
+    el2.textContent = msg; el2.classList.toggle('err', err);
+    var b = $('#sheet-sync'); if (b) b.disabled = !S.mcp || S.syncing;
+  }
+
+  /* ---------------- the artwork ---------------- */
+  var ART = { w: 1600, h: 2692 };
+  // Position of every tile in the YM_Advent artwork (px in the 1600x2692 render); tiles/tN.webp is its cut-out.
+  var TILES = [
+    { n: 1, x: 132, y: 586, w: 536, h: 576 }, { n: 2, x: 674, y: 594, w: 273, h: 568 }, { n: 3, x: 952, y: 594, w: 521, h: 568 },
+    { n: 4, x: 135, y: 1177, w: 320, h: 450 }, { n: 5, x: 463, y: 1177, w: 641, h: 451 }, { n: 6, x: 1110, y: 1168, w: 364, h: 461 },
+    { n: 7, x: 134, y: 1640, w: 340, h: 434 }, { n: 8, x: 478, y: 1638, w: 611, h: 433 }, { n: 9, x: 1095, y: 1640, w: 379, h: 433 },
+    { n: 10, x: 135, y: 2085, w: 307, h: 521 }, { n: 11, x: 448, y: 2081, w: 539, h: 525 }, { n: 12, x: 993, y: 2085, w: 481, h: 521 }
+  ];
+
+  /* ================= KIOSK ================= */
+  var kiosk = $('#kiosk'), stage = $('#stage');
+
+  function fit() {
+    var k = Math.min(innerWidth / ART.w, innerHeight / ART.h);
+    stage.style.setProperty('--k', k);
+    S.ck = Math.min(innerWidth / 1180, innerHeight / 1560, 1.9);     // gift card scale: about 60% of the screen width, as in the reference recording
+    kiosk.style.setProperty('--ck', S.ck);
+    [$('#sky'), $('#storm')].forEach(function (c) {
+      var dpr = Math.min(window.devicePixelRatio || 1, 2);
+      c.width = Math.round(innerWidth * dpr); c.height = Math.round(innerHeight * dpr);
+      c.getContext('2d').setTransform(dpr, 0, 0, dpr, 0, 0);
+    });
+  }
+
+  // The small gift box that waits in an opened niche.
+  var GIFT_BOX = '<svg viewBox="0 0 48 48" aria-hidden="true"><rect x="7" y="21" width="34" height="21" rx="2.5" fill="#EE1F78"/><rect x="4" y="13" width="40" height="9" rx="2.5" fill="#FF4C97"/><rect x="21.5" y="13" width="5" height="29" fill="#FFC2DB"/><path d="M24 13c-3.2-7-11.2-8.2-12.2-4.2S16.800 13.800 24 13Zm0 0c3.200-7 11.200-8.200 12.200-4.200S31.200 13.800 24 13Z" fill="#FF4C97"/></svg>';
+
+  // Sparkles and rings on the pink card (positions inside the 732 x 834 pink area).
+  var preloaded = [];
+  function preloadGift(gift) {
+    var im = new Image(); im.src = gift && gift.imageId ? imgUrl(gift.imageId) : 'giftcard.svg';
+    if (im.decode) im.decode().catch(function () {});
+    preloaded.push(im); if (preloaded.length > 6) preloaded.shift();
+  }
+
+  function buildCardFx() {
+    setTimeout(function () { if (reduceMotion) return; ensureSprites(); if (S.effect === 'galaxy') { if (!galaxy) galaxy = buildGalaxy(); } else if (!vortex) vortex = buildVortex(); }, 400);   // paint the spiral once, before anyone taps
+    preloadGift(null);                                   // the default picture, decoded once at start
+    var fx = el('div', 'card-fx');
+    [380, 510].forEach(function (d) { var r = el('span', 'ring'); r.style.setProperty('--d', d + 'px'); fx.appendChild(r); });
+    [[86, 96, 20, 0], [640, 150, 16, 1], [118, 330, 12, 0], [612, 300, 22, 0], [70, 520, 10, 1], [668, 470, 12, 1], [150, 700, 14, 0], [590, 690, 10, 0],
+     [330, 430, 7, 1], [468, 520, 6, 1], [232, 560, 6, 1], [560, 420, 7, 1], [96, 220, 6, 1], [520, 96, 8, 1], [210, 120, 7, 1], [640, 600, 7, 1], [300, 770, 6, 1], [436, 740, 8, 1]
+    ].forEach(function (a, i) {
+      var sp = el('span', 'spark' + (a[3] ? ' dot' : ''));
+      sp.style.cssText = 'left:' + a[0] + 'px;top:' + a[1] + 'px;--z:' + a[2] + 'px;animation-delay:' + (-(i * 0.37) % 2.6).toFixed(2) + 's;animation-duration:' + (2.2 + (i % 5) * 0.35).toFixed(2) + 's;';
+      fx.appendChild(sp);
+    });
+    var card = $('#rv-card'); card.insertBefore(fx, card.firstChild);
+  }
+
+  function buildDoors() {
+    TILES.forEach(function (t) {
+      var src = 'url(tiles/t' + t.n + '.webp)';
+      var cell = el('div', 'door-cell');
+      cell.style.cssText = 'left:' + t.x + 'px;top:' + t.y + 'px;width:' + t.w + 'px;height:' + t.h + 'px;';
+      var niche = el('div', 'niche');
+      niche.style.webkitMaskImage = src; niche.style.maskImage = src;
+      niche.style.setProperty('--gs', Math.round(Math.min(t.w, t.h) * 0.36) + 'px');
+      niche.innerHTML = GIFT_BOX;
+      cell.appendChild(niche);
+      var face = el('button', 'door-face');
+      face.type = 'button';
+      face.setAttribute('aria-label', 'Պատուհան ' + t.n);
+      face.style.backgroundImage = src;
+      face.addEventListener('click', function () { onDoorTap(cell, t); });
+      cell.appendChild(face);
+      stage.appendChild(cell);
+    });
+  }
+
+  function rng(seed) { return function () { seed = (seed * 9301 + 49297) % 233280; return seed / 233280; }; }
+
+  /* --- ambient: soft snowfall over the artwork --- */
+  var sky = { flakes: [] };
+  function initSky() {
+    var r = rng(7);
+    for (var j = 0; j < 70; j++) sky.flakes.push({ x: r(), y: r(), s: 1 + r() * 2.8, v: 0.2 + r() * 0.5, sway: 8 + r() * 26, p: r() * 6.28 });
+  }
+  function drawSky(ts) {
+    var c = $('#sky'), ctx = c.getContext('2d'), W = innerWidth, H = innerHeight, t = ts / 1000;
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#FFFFFF';
+    sky.flakes.forEach(function (f) {
+      f.y += f.v / H * 2; if (f.y > 1.02) { f.y = -0.02; }
+      var x = f.x * W + Math.sin(t * 0.6 + f.p) * f.sway;
+      ctx.globalAlpha = 0.22 + f.s / 9;
+      ctx.beginPath(); ctx.arc(x, f.y * H, f.s, 0, 6.283); ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+    if (!reduceMotion) requestAnimationFrame(drawSky);
+  }
+
+  /* --- snow gust: a light swirl of snow drifts out of the opened window, floats to the centre and settles; the card appears in it --- */
+  var STORM = { lead: 260, total: 1500, vortex: 900 };          // ms after the tap: when the gust starts, when the card appears
+  var storm = { parts: [], running: false, t0: 0, last: 0, ex: 0, ey: 0, spawned: 0, sprites: null };
+  function snowDot(rgb, core) {
+    var c = document.createElement('canvas'); c.width = c.height = 64;
+    var g = c.getContext('2d'), gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gr.addColorStop(0, 'rgba(' + rgb + ',' + core + ')'); gr.addColorStop(0.35, 'rgba(' + rgb + ',' + (core * 0.45) + ')'); gr.addColorStop(1, 'rgba(' + rgb + ',0)');
+    g.fillStyle = gr; g.fillRect(0, 0, 64, 64); return c;
+  }
+  function snowFlake() {                            // a thin six-arm snowflake
+    var c = document.createElement('canvas'); c.width = c.height = 64;
+    var g = c.getContext('2d'); g.translate(32, 32); g.strokeStyle = 'rgba(255,255,255,.95)'; g.lineWidth = 2.2; g.lineCap = 'round';
+    for (var i = 0; i < 6; i++) {
+      g.rotate(Math.PI / 3); g.beginPath(); g.moveTo(0, 0); g.lineTo(0, -27);
+      g.moveTo(0, -16); g.lineTo(-7, -23); g.moveTo(0, -16); g.lineTo(7, -23); g.stroke();
+    }
+    return c;
+  }
+  var clamp01 = function (v) { return v < 0 ? 0 : v > 1 ? 1 : v; };
+  var easeOut = function (v) { v = clamp01(v); return 1 - Math.pow(1 - v, 3); };
+  var easeInOut = function (v) { v = clamp01(v); return v < 0.5 ? 4 * v * v * v : 1 - Math.pow(-2 * v + 2, 3) / 2; };
+  function ensureSprites() { if (!storm.sprites) storm.sprites = { snow: snowDot('255,255,255', 0.95), blush: snowDot('214,228,244', 0.9), flake: snowFlake() }; }
+  function startStorm(cell) {
+    if (reduceMotion) return;
+    var r = cell.getBoundingClientRect();
+    storm.ex = r.left + r.width / 2; storm.ey = r.top + r.height / 2;
+    storm.parts = []; storm.spawned = 0; storm.lx = null; storm.ly = null; storm.lp = null; storm.acc = 0; storm.revealT = null; storm.t0 = performance.now(); storm.last = storm.t0;
+    ensureSprites();
+    if (!storm.sprites) storm.sprites = { snow: snowDot('255,255,255', 0.95), blush: snowDot('255,222,234', 0.9), flake: snowFlake() };
+    $('#storm-veil').classList.add('on');
+    if (!storm.running) { storm.running = true; requestAnimationFrame(S.effect === 'swirl' ? stepSwirl : S.effect === 'ribbon' ? stepRibbon : S.effect === 'tornado' ? stepTornado : S.effect === 'galaxy' ? stepGalaxy : stepVortex); }
+  }
+  function stopStorm() {
+    storm.running = false; storm.parts = [];
+    var c = $('#storm'); c.getContext('2d').clearRect(0, 0, innerWidth, innerHeight);
+    $('#storm-veil').classList.remove('on');
+  }
+  // Variant "swirl": the snow spins out of the window as a small whirl, floats to the centre and settles.
+  function stepSwirl(ts) {
+    if (!storm.running) return;
+    var c = $('#storm'), ctx = c.getContext('2d'), W = innerWidth, H = innerHeight;
+    var t = (ts - storm.t0) / 1000, dt = Math.min(0.05, (ts - storm.last) / 1000); storm.last = ts;
+    var u = Math.min(W, H) / 1080, sp = storm.sprites;
+    // The centre of the swirl leaves the window and floats to where the card will stand.
+    var k = easeInOut((t - 0.45) / 0.7);
+    var tx = W / 2, ty = H / 2 - 40 * u;
+    var cx = storm.ex + (tx - storm.ex) * k, cy = storm.ey + (ty - storm.ey) * k;
+    var endFade = clamp01((2.3 - t) / 0.8);
+
+    // soft trails: fade what was drawn instead of clearing it
+    ctx.globalCompositeOperation = 'destination-out'; ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(0,0,0,.3)'; ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'source-over';
+
+    // a breath of cold light at the window
+    var breath = (120 + 240 * easeOut(t / 0.5)) * u, breathA = 0.5 * clamp01(t / 0.12) * (1 - clamp01((t - 0.25) / 0.55));
+    if (breathA > 0.01) { ctx.globalAlpha = breathA; ctx.drawImage(sp.snow, storm.ex - breath / 2, storm.ey - breath / 2, breath, breath); }
+
+    // two thin lines of wind curling around the centre
+    var grow = easeOut(t / 0.7) * (1 - 0.5 * easeInOut((t - 1.0) / 0.45));
+    var windA = 0.42 * clamp01(t / 0.2) * clamp01((1.55 - t) / 0.4);
+    if (windA > 0.01) {
+      ctx.lineCap = 'round'; ctx.lineWidth = Math.max(1, 1.6 * u);
+      for (var a = 0; a < 2; a++) {
+        var px0 = 0, py0 = 0;
+        for (var i = 3; i < 64; i++) {
+          var ang = a * 3.1416 + i * 0.105 - t * 4.6, rad = i * 8.5 * u * grow;
+          var x = cx + Math.cos(ang) * rad, y = cy + Math.sin(ang) * rad * 0.86;
+          if (i > 3) { ctx.strokeStyle = 'rgba(255,255,255,' + (windA * Math.sin(Math.PI * (i - 3) / 61)).toFixed(3) + ')'; ctx.beginPath(); ctx.moveTo(px0, py0); ctx.lineTo(x, y); ctx.stroke(); }
+          px0 = x; py0 = y;
+        }
+      }
+    }
+
+    // snow carried by the gust: it swirls out, gathers a little, then simply falls
+    var want = Math.floor(190 * clamp01(t / 0.9));
+    while (storm.spawned < want) {
+      storm.spawned++;
+      var flake = Math.random() < 0.1;
+      storm.parts.push({ a: Math.random() * 6.283, r: Math.random() * 18 * u, vr: (70 + Math.random() * 430) * u, w: -(2.0 + Math.random() * 2.6),
+        s: (flake ? 9 + Math.random() * 9 : 1.6 + Math.random() * 4.6) * u, flake: flake, blush: Math.random() < 0.3,
+        born: t, life: 1.1 + Math.random() * 0.9, rot: Math.random() * 6.283, vrot: (Math.random() - 0.5) * 3, fall: 0, vy: 0, sw: Math.random() * 6.283 });
+    }
+    var pull = 1 - 1.7 * easeInOut((t - 0.85) / 0.5), settle = clamp01((t - 1.2) / 0.5);
+    for (var n = storm.parts.length - 1; n >= 0; n--) {
+      var q = storm.parts[n], age = t - q.born;
+      if (age > q.life) { storm.parts.splice(n, 1); continue; }
+      q.r = Math.max(0, q.r + q.vr * dt * pull * (1 - settle));
+      q.a += q.w * dt * (1 - 0.8 * settle) / (1 + q.r / (480 * u));
+      q.vy += 260 * u * settle * dt; q.fall += q.vy * dt; q.rot += q.vrot * dt;
+      var px = cx + Math.cos(q.a) * q.r + Math.sin(t * 2.4 + q.sw) * 10 * u * settle, py = cy + Math.sin(q.a) * q.r * 0.86 + q.fall;
+      ctx.globalAlpha = clamp01(age / 0.15) * clamp01((q.life - age) / 0.5) * endFade * (q.flake ? 0.85 : 0.9);
+      if (q.flake) { ctx.save(); ctx.translate(px, py); ctx.rotate(q.rot); ctx.drawImage(sp.flake, -q.s, -q.s, q.s * 2, q.s * 2); ctx.restore(); }
+      else ctx.drawImage(q.blush ? sp.blush : sp.snow, px - q.s * 2, py - q.s * 2, q.s * 4, q.s * 4);
+    }
+
+    // a soft white puff where the card appears
+    var puff = 1 - Math.abs(t - 1.3) / 0.36;
+    if (puff > 0) { var ps = (360 + 380 * puff) * u; ctx.globalAlpha = 0.42 * puff; ctx.drawImage(sp.snow, tx - ps / 2, ty - ps / 2, ps, ps); }
+
+    ctx.globalAlpha = 1;
+    if (t > 2.35) { stopStorm(); return; }
+    requestAnimationFrame(stepSwirl);
+  }
+
+  // Variant "vortex" (after the second reference picture): a snow whirlpool seen face-on. Dozens of curved, brushy
+  // snow strokes wind into a glowing white eye while snowflakes fly out of it with motion blur. The strokes are painted
+  // once into two textures (the whole whirl and a tighter inner eye); a frame only turns and scales them.
+  var vortex = null;
+  function buildVortex() {
+    var N = 1024, C = 512, R = 480, r = rng(211), B = 0.2;
+    var mk = function () { var cv = document.createElement('canvas'); cv.width = cv.height = N; return cv; };
+    var whirl = mk(), eye = mk(), gw = whirl.getContext('2d'), ge = eye.getContext('2d');
+    var cols = ['242,246,250', '226,234,244', '208,220,234', '186,202,222'];
+    gw.lineCap = ge.lineCap = 'butt';
+    function brush(g, r0, th0, len, w, a) {               // one tapered brush stroke along a spiral, built from bristles
+      var steps = Math.max(8, Math.round(len * 14)), col = cols[Math.floor(r() * cols.length)];
+      var bristles = [[0, 1, 0.3, col]];                   // a wide soft base, then thin brighter hairs inside it
+      var nb = 3 + Math.floor(r() * 4);
+      for (var k = 0; k < nb; k++) bristles.push([(r() - 0.5) * 0.9, 0.12 + r() * 0.18, 0.6, r() < 0.5 ? '246,249,252' : col]);
+      bristles.forEach(function (bz) {
+        var px = null, py = null;
+        for (var s2 = 0; s2 <= steps; s2++) {
+          var f = s2 / steps, th = th0 + len * f, rr = r0 * Math.exp(B * len * f) + bz[0] * w;
+          var x = C + Math.cos(th) * rr, y = C + Math.sin(th) * rr;
+          if (px !== null) {
+            var taper = Math.sin(Math.PI * Math.min(1, f * 1.15));       // thin at the start, fuller towards the tail
+            g.globalAlpha = a * bz[2] * (0.25 + 0.75 * taper);
+            g.strokeStyle = 'rgb(' + bz[3] + ')'; g.lineWidth = Math.max(0.6, w * bz[1] * (0.35 + 0.65 * taper));
+            g.beginPath(); g.moveTo(px, py); g.lineTo(x, y); g.stroke();
+          }
+          px = x; py = y;
+        }
+      });
+    }
+    for (var i = 0; i < 170; i++) {                         // the whirl: long strokes, wider and softer further out
+      var r0 = R * (0.06 + 0.8 * Math.pow(r(), 0.9)), q = r0 / R;
+      brush(gw, r0, r() * 6.283, 0.7 + r() * 1.9, (6 + 46 * q) * (0.6 + r() * 0.7), 0.05 + 0.3 * r() * r());
+    }
+    for (var h = 0; h < 26; h++) {                          // a few fuller sweeps, like the bright arms in the reference
+      var h0 = R * (0.1 + 0.6 * r());
+      brush(gw, h0, r() * 6.283, 1.2 + r() * 1.6, (16 + 44 * h0 / R) * (0.7 + r() * 0.5), 0.26 + 0.18 * r());
+    }
+    // turn smooth brush lines into powder: soften them, then eat them with fine grain so they read as packed snow
+    function powder(cv, g, blur, keep, grain) {
+      var tmp = mk(), gt = tmp.getContext('2d');
+      gt.filter = 'blur(' + blur + 'px)'; gt.drawImage(cv, 0, 0); gt.filter = 'none';
+      gt.globalAlpha = keep; gt.drawImage(cv, 0, 0); gt.globalAlpha = 1;
+      var nz = document.createElement('canvas'); nz.width = nz.height = 256;
+      var gn = nz.getContext('2d'), im = gn.createImageData(256, 256), dd = im.data;
+      for (var y = 0; y < 256; y += 2) for (var x = 0; x < 256; x += 2) {
+        var v = r(); v = Math.round(255 * Math.pow(v, 0.6) * grain);
+        for (var oy = 0; oy < 2; oy++) for (var ox = 0; ox < 2; ox++) dd[((y + oy) * 256 + x + ox) * 4 + 3] = v;
+      }
+      gn.putImageData(im, 0, 0);
+      gt.globalCompositeOperation = 'destination-out'; gt.fillStyle = gt.createPattern(nz, 'repeat'); gt.fillRect(0, 0, N, N);
+      gt.globalCompositeOperation = 'source-over';
+      g.globalAlpha = 1; g.clearRect(0, 0, N, N); g.drawImage(tmp, 0, 0);
+    }
+    powder(whirl, gw, 2.5, 0.7, 0.62);
+    for (var j = 0; j < 120; j++) {                          // the eye: short tight strokes near the centre
+      var e0 = R * (0.02 + 0.3 * r());
+      brush(ge, e0, r() * 6.283, 0.8 + r() * 1.6, (3 + 16 * e0 / R) * (0.6 + r() * 0.7), 0.18 + 0.3 * r());
+    }
+    var dot = snowDot('255,255,255', 1);
+    for (var d = 0; d < 2600; d++) {                         // frosty spray clinging to the strokes
+      var a2 = r() * 6.283, rr2 = R * Math.pow(r(), 0.8) * 0.95, z = 1.2 + r() * 2.4;
+      gw.globalAlpha = 0.14 + 0.3 * r(); gw.drawImage(dot, C + Math.cos(a2) * rr2 - z, C + Math.sin(a2) * rr2 - z, z * 2, z * 2);
+    }
+    function glow(g, rad, al) { var gr = g.createRadialGradient(C, C, 0, C, C, rad); gr.addColorStop(0, 'rgba(255,255,255,' + al + ')'); gr.addColorStop(0.35, 'rgba(236,244,255,' + al * 0.5 + ')'); gr.addColorStop(1, 'rgba(220,232,250,0)'); g.globalAlpha = 1; g.fillStyle = gr; g.fillRect(0, 0, N, N); }
+    powder(eye, ge, 2, 0.5, 0.6); glow(ge, R * 0.26, 0.42);
+    function fade(g, inner, outer) {                        // soft round edge
+      var gr = g.createRadialGradient(C, C, inner, C, C, outer); gr.addColorStop(0, 'rgba(0,0,0,1)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+      g.globalAlpha = 1; g.globalCompositeOperation = 'destination-in'; g.fillStyle = gr; g.fillRect(0, 0, N, N); g.globalCompositeOperation = 'source-over';
+    }
+    fade(gw, R * 0.55, R); fade(ge, R * 0.12, R * 0.42);
+    var back = document.createElement('canvas'); back.width = back.height = 256;  // the dark slate sky behind the whirl
+    var gb = back.getContext('2d'), grb = gb.createRadialGradient(128, 128, 0, 128, 128, 128);
+    grb.addColorStop(0, 'rgba(30,40,60,1)'); grb.addColorStop(0.55, 'rgba(24,32,50,.94)'); grb.addColorStop(1, 'rgba(22,28,44,0)');
+    gb.fillStyle = grb; gb.fillRect(0, 0, 256, 256);
+    return { whirl: whirl, eye: eye, back: back, R: R, C: C };
+  }
+  function stepVortex(ts) {
+    if (!storm.running) return;
+    if (!vortex) vortex = buildVortex();
+    var c = $('#storm'), ctx = c.getContext('2d'), W = innerWidth, H = innerHeight;
+    var t = (ts - storm.t0) / 1000, dt = Math.min(0.05, (ts - storm.last) / 1000); storm.last = ts;
+    var u = Math.min(W, H) / 1080, sp = storm.sprites, v = vortex;
+    var easeSine = function (x) { x = clamp01(x); return 0.5 - 0.5 * Math.cos(Math.PI * x); };
+    var smooth = function (x) { x = clamp01(x); return x * x * (3 - 2 * x); };
+    // it opens out of the gift box, glides to the centre while growing, and keeps turning behind the card
+    var m = easeSine((t - 0.04) / 0.6);
+    var rv = storm.revealT, fade = rv == null ? 0 : smooth((t - rv) / 0.55);   // holds full size until the card is shown
+    var cx = storm.ex + (W / 2 - storm.ex) * m, cy = storm.ey + (H / 2 - 40 * u - storm.ey) * m;
+    var Rs = (36 + (520 - 36) * smooth(t / 0.7)) * u * (1 + 0.15 * fade);   // grows slowly out of the box   // on-screen radius
+    var scale = Rs / v.R;
+    var spin = -(1.7 * t + 2.4 * (1 - Math.exp(-t / 0.45)));      // a fast start that calms down, never jumps
+    var A = 0.92 * smooth(t / 0.15) * (1 - fade);
+    ctx.clearRect(0, 0, W, H);
+
+    if (A > 0.01) {
+      var bz = Rs * 3.1; ctx.globalAlpha = Math.min(1, A * 1.15); ctx.drawImage(v.back, cx - bz / 2, cy - bz / 2, bz, bz);
+      [[v.whirl, spin, 1], [v.eye, spin * 1.6, 1]].forEach(function (L) {
+        ctx.save(); ctx.globalAlpha = A * L[2]; ctx.translate(cx, cy); ctx.scale(scale, scale); ctx.rotate(L[1]);
+        ctx.drawImage(L[0], -v.C, -v.C); ctx.restore();
+      });
+    }
+
+    // snowflakes flung out of the eye, turning with the whirl, smeared by their speed
+    if (t > 0.05 && (rv == null || t < rv + 0.25)) {
+      storm.acc += 140 * dt;
+      while (storm.acc >= 1) {
+        storm.acc -= 1;
+        var a = Math.random() * 6.283, rr = Rs * (0.08 + Math.random() * 0.75), dx = Math.cos(a), dy = Math.sin(a);
+        var spd = (160 + Math.random() * 300) * u * (0.6 + rr / Rs) * (0.3 + 0.7 * Rs / (520 * u));   // small whirl, short throws
+        storm.parts.push({ x: cx + dx * rr, y: cy + dy * rr, vx: (dy * 0.95 + dx * 0.45) * spd, vy: (-dx * 0.95 + dy * 0.45) * spd,
+          s: (1.4 + Math.random() * Math.random() * 4.5) * u, born: t, life: 0.6 + Math.random() * 0.9 });
+      }
+    }
+    var drag = Math.pow(0.4, dt);
+    for (var n = storm.parts.length - 1; n >= 0; n--) {
+      var q = storm.parts[n], age = t - q.born;
+      if (age > q.life) { storm.parts.splice(n, 1); continue; }
+      // bend the path a little each frame so the flakes curl with the whirl
+      var ox = q.x - cx, oy = q.y - cy, d2 = Math.hypot(ox, oy) || 1, curl = 2.2 * dt;
+      q.vx = (q.vx + oy / d2 * curl * 300 * u) * drag; q.vy = (q.vy - ox / d2 * curl * 300 * u) * drag;
+      q.x += q.vx * dt; q.y += q.vy * dt;
+      var sp2 = Math.hypot(q.vx, q.vy), len = Math.min(1 + sp2 * 0.003 / u, 1.6);
+      ctx.globalAlpha = smooth(age / 0.12) * (1 - smooth((age - q.life + 0.4) / 0.4)) * 0.75;
+      ctx.save(); ctx.translate(q.x, q.y); ctx.rotate(Math.atan2(q.vy, q.vx));
+      ctx.drawImage(sp.snow, -q.s * 2 * len, -q.s * 2, q.s * 4 * len, q.s * 4); ctx.restore();
+    }
+
+    ctx.globalAlpha = 1;
+    if ((rv != null && t > rv + 0.75) || t > 10) { stopStorm(); return; }
+    requestAnimationFrame(stepVortex);
+  }
+
+  // Variant "galaxy" (after the reference picture): a spiral of fine powdery snow with two soft arms, misty bands
+  // and bright specks. The spiral is painted once into two textures (outer arms and core) while the page is idle;
+  // each frame only turns, tilts and scales them, so the animation stays smooth on the kiosk.
+  var galaxy = null;
+  function buildGalaxy() {
+    var N = 1024, C = 512, Rg = 470, r = rng(97);
+    var gauss = function () { return (r() + r() + r() + r() - 2) / 1.15; };
+    var mk = function () { var cv = document.createElement('canvas'); cv.width = cv.height = N; return cv; };
+    var outer = mk(), core = mk(), go = outer.getContext('2d'), gc = core.getContext('2d');
+    var mist = snowDot('196,214,234', 0.55), dot = snowDot('240,246,252', 1), ice = snowDot('168,192,218', 0.95);
+    var sm = function (v) { v = v < 0 ? 0 : v > 1 ? 1 : v; return v * v * (3 - 2 * v); };
+    function put(x, y, sprite, size, alpha) {
+      var wo = sm((Math.hypot(x, y) / Rg - 0.2) / 0.16), wc = 1 - wo;   // feathered split between core and arms
+      if (wo > 0.01) { go.globalAlpha = alpha * wo; go.drawImage(sprite, C + x - size / 2, C + y - size / 2, size, size); }
+      if (wc > 0.01) { gc.globalAlpha = alpha * wc; gc.drawImage(sprite, C + x - size / 2, C + y - size / 2, size, size); }
+    }
+    var TURNS = 2.6 * Math.PI, b = Math.log(0.9 / 0.05) / TURNS, sparks = [];
+    for (var arm = 0; arm < 2; arm++) {
+      var off = arm * Math.PI + (arm ? 0.35 : 0), thick = arm ? 0.9 : 1.2;   // one heavier arm, as in the reference
+      for (var i = 0; i < 6500; i++) {
+        var th = Math.pow(r(), 0.85) * TURNS, rad = 0.05 * Math.exp(b * th), ang = th + off;
+        var sig = (0.026 + 0.075 * rad) * thick * Rg;
+        var x = Math.cos(ang) * rad * Rg + gauss() * sig, y = Math.sin(ang) * rad * Rg + gauss() * sig, k = r();
+        if (k < 0.1) put(x, y, mist, (30 + 120 * rad) * (0.7 + r() * 0.6), 0.2);             // soft misty band
+        else if (k < 0.135) { put(x, y, dot, 5 + r() * 7, 0.95); if (sparks.length < 90 && rad > 0.15) sparks.push([x, y, r() * 6.28]); }
+        else put(x, y, r() < 0.6 ? dot : ice, 1.8 + r() * 3.6, 0.5 + r() * 0.5);             // fine snow dust
+      }
+    }
+    for (var j = 0; j < 1600; j++) { var a = r() * 6.283, rr = Math.pow(r(), 0.75) * 0.95; put(Math.cos(a) * rr * Rg, Math.sin(a) * rr * Rg, ice, 1 + r() * 2.4, 0.16 + r() * 0.3); }
+    put(0, 0, mist, 300, 0.8); put(0, 0, dot, 150, 0.6); put(0, 0, dot, 60, 0.7);                                       // a soft bright core
+    return { outer: outer, core: core, Rg: Rg, C: C, sparks: sparks, b: b, turns: TURNS, dark: snowDot('14,18,36', 0.8) };
+  }
+  function stepGalaxy(ts) {
+    if (!storm.running) return;
+    if (!galaxy) galaxy = buildGalaxy();
+    var c = $('#storm'), ctx = c.getContext('2d'), W = innerWidth, H = innerHeight;
+    var t = (ts - storm.t0) / 1000, dt = Math.min(0.05, (ts - storm.last) / 1000); storm.last = ts;
+    var u = Math.min(W, H) / 1080, sp = storm.sprites, g = galaxy;
+    var easeSine = function (v) { v = clamp01(v); return 0.5 - 0.5 * Math.cos(Math.PI * v); };
+    var smooth = function (v) { v = clamp01(v); return v * v * (3 - 2 * v); };
+    var ty = H / 2 - 40 * u, TILT = -0.38, FLAT = 0.6;
+    // it leaves the gift box small and fast, glides to the centre while it grows, and slowly unwinds behind the card
+    var m = easeSine((t - 0.12) / 0.92);
+    var cx = storm.ex + (W / 2 - storm.ex) * m, cy = storm.ey + (ty - storm.ey) * m;
+    var s0 = 60 * u / g.Rg, s1 = 430 * u / g.Rg;
+    var scale = (s0 + (s1 - s0) * smooth((t - 0.02) / 1.05)) * (1 + 0.22 * smooth((t - 1.2) / 0.8));
+    var spin = -(2.0 * t + 2.7 * (1 - Math.exp(-t / 0.45)));        // fast at first, then a calm turn; never jumps
+    var A = smooth(t / 0.2) * (1 - smooth((t - 1.3) / 0.8));
+    var toScreen = function (x, y, sp2) {
+      var cs = Math.cos(sp2), sn = Math.sin(sp2), X = (x * cs - y * sn) * scale, Y = (x * sn + y * cs) * scale * FLAT;
+      var ct = Math.cos(TILT), st = Math.sin(TILT);
+      return [cx + X * ct - Y * st, cy + X * st + Y * ct];
+    };
+    ctx.clearRect(0, 0, W, H);
+
+    var breathA = 0.4 * smooth(t / 0.1) * (1 - smooth((t - 0.15) / 0.5));
+    if (breathA > 0.01) { var bs = 240 * u; ctx.globalAlpha = breathA; ctx.drawImage(sp.snow, storm.ex - bs / 2, storm.ey - bs / 2, bs, bs); }
+
+    if (A > 0.01) { var hz = g.Rg * scale * 2.6; ctx.save(); ctx.globalAlpha = A * 0.85; ctx.translate(cx, cy); ctx.rotate(TILT); ctx.scale(1, FLAT * 1.15); ctx.drawImage(g.dark, -hz / 2, -hz / 2, hz, hz); ctx.restore(); }
+    // the two painted layers: the core turns faster than the arms, so the spiral winds up as it spins
+    [[g.outer, spin], [g.core, spin * 1.45]].forEach(function (L) {
+      if (A < 0.01) return;
+      ctx.save(); ctx.globalAlpha = A;
+      ctx.translate(cx, cy); ctx.rotate(TILT); ctx.scale(scale, scale * FLAT); ctx.rotate(L[1]);
+      ctx.drawImage(L[0], -g.C, -g.C);
+      ctx.restore();
+    });
+
+    // bright specks riding on the arms, twinkling
+    for (var i = 0; i < g.sparks.length; i++) {
+      var k = g.sparks[i], pt = toScreen(k[0], k[1], spin), tw = 0.5 + 0.5 * Math.sin(t * 9 + k[2]);
+      var z = (3 + 5 * tw) * u; ctx.globalAlpha = A * (0.35 + 0.65 * tw);
+      ctx.drawImage(sp.snow, pt[0] - z, pt[1] - z, z * 2, z * 2);
+    }
+
+    // snow dust thrown off the ends of the arms
+    if (t > 0.2 && t < 1.3) {
+      storm.acc += 170 * dt;
+      while (storm.acc >= 1) {
+        storm.acc -= 1;
+        var arm = Math.random() < 0.5 ? 0 : 1, th = (0.72 + Math.random() * 0.28) * g.turns, rad = 0.05 * Math.exp(g.b * th);
+        var ang = th + arm * Math.PI + (arm ? 0.35 : 0), px = Math.cos(ang) * rad * g.Rg, py = Math.sin(ang) * rad * g.Rg;
+        var p1 = toScreen(px, py, spin), p2 = toScreen(px, py, spin - 0.05);   // direction of the turn at that point
+        var vx = (p2[0] - p1[0]) * 22 + (p1[0] - cx) * 0.6, vy = (p2[1] - p1[1]) * 22 + (p1[1] - cy) * 0.6;
+        storm.parts.push({ x: p1[0], y: p1[1], vx: vx, vy: vy, s: (1 + Math.random() * 2.6) * u, born: t, life: 0.6 + Math.random() * 0.7, ice: Math.random() < 0.5 });
+      }
+    }
+    var drag = Math.pow(0.25, dt);
+    for (var n = storm.parts.length - 1; n >= 0; n--) {
+      var q = storm.parts[n], age = t - q.born;
+      if (age > q.life) { storm.parts.splice(n, 1); continue; }
+      q.vx *= drag; q.vy = q.vy * drag + 60 * u * dt; q.x += q.vx * dt; q.y += q.vy * dt;
+      ctx.globalAlpha = smooth(age / 0.1) * (1 - smooth((age - q.life + 0.4) / 0.4)) * 0.85;
+      ctx.drawImage(q.ice ? sp.blush : sp.snow, q.x - q.s * 2, q.y - q.s * 2, q.s * 4, q.s * 4);
+    }
+
+    ctx.globalAlpha = 1;
+    if (t > 2.2) { stopStorm(); return; }
+    requestAnimationFrame(stepGalaxy);
+  }
+
+  // Variant "tornado": a small snow tornado rises out of the gift box in the window, glides to the centre while it
+  // grows, and comes apart into drifting snow as the card appears inside it. Every motion is a smooth curve of time,
+  // and the tornado never switches from one motion to another, so nothing jumps.
+  function stepTornado(ts) {
+    if (!storm.running) return;
+    var c = $('#storm'), ctx = c.getContext('2d'), W = innerWidth, H = innerHeight;
+    var t = (ts - storm.t0) / 1000, dt = Math.min(0.05, (ts - storm.last) / 1000); storm.last = ts;
+    var u = Math.min(W, H) / 1080, sp = storm.sprites;
+    var easeSine = function (v) { v = clamp01(v); return 0.5 - 0.5 * Math.cos(Math.PI * v); };
+    var smooth = function (v) { v = clamp01(v); return v * v * (3 - 2 * v); };
+    var ty = H / 2 - 40 * u, REL = 1.2;
+    // the foot of the funnel leaves the gift box and glides to just below the card's centre
+    var m = easeSine((t - 0.18) / 0.9);
+    var fx = storm.ex + (W / 2 - storm.ex) * m, fy = (storm.ey + 12 * u) + (ty + 300 * u - storm.ey - 12 * u) * m;
+    var sc = 0.36 + 0.64 * smooth((t - 0.05) / 1.05), rise = smooth(t / 0.4);
+    var Hf = 660 * u * sc * rise, r0 = 10 * u + 10 * u * sc, r1 = 270 * u * sc;
+    var spread = smooth((t - REL) / 0.55);                 // the funnel opens up as it comes apart
+    var axis = function (h) { return [fx + Math.sin(t * 2.3 + h * 3.2) * 16 * u * h * sc, fy - Hf * h]; };
+    var rad = function (h) { return (r0 + (r1 - r0) * Math.pow(h, 1.12)) * (1 + 0.5 * spread); };
+    var omega = function (h) { return (8.5 - 3.5 * h) * (1 - 0.7 * spread); };
+    var presence = smooth(t / 0.15) * (1 - smooth((t - REL) / 0.45));
+    ctx.clearRect(0, 0, W, H);
+
+    // light from the box at the start, a soft puff behind the card at the end
+    var breathA = 0.42 * smooth(t / 0.1) * (1 - smooth((t - 0.15) / 0.5));
+    if (breathA > 0.01) { var bs = 240 * u; ctx.globalAlpha = breathA; ctx.drawImage(sp.snow, storm.ex - bs / 2, storm.ey - bs / 2, bs, bs); }
+    var puff = smooth((t - 0.95) / 0.3) * (1 - smooth((t - 1.35) / 0.6));
+    if (puff > 0.01) { var ps = 760 * u; ctx.globalAlpha = 0.3 * puff; ctx.drawImage(sp.snow, W / 2 - ps / 2, ty - ps / 2, ps, ps); }
+
+    // a soft body of mist inside the funnel
+    if (presence > 0.01 && Hf > 4) {
+      for (var mk = 0; mk < 9; mk++) {
+        var hm = (mk + 0.5) / 9, am = axis(hm), rm2 = rad(hm) * 2.1;
+        ctx.globalAlpha = 0.07 * presence;
+        ctx.drawImage(sp.snow, am[0] - rm2 / 2, am[1] - rm2 * 0.22, rm2, rm2 * 0.44);
+      }
+    }
+
+    // thin wind lines circling the funnel
+    if (presence > 0.01 && Hf > 4) {
+      ctx.lineWidth = Math.max(1, 1.7 * u); ctx.strokeStyle = '#fff'; ctx.lineCap = 'round';
+      for (var k = 0; k < 11; k++) {
+        var hk = (k + 0.6) / 11, ak = axis(hk), rk = rad(hk), st = -t * omega(hk) * 0.9 + k * 1.1;
+        ctx.globalAlpha = 0.38 * presence * (0.55 + 0.45 * hk);
+        ctx.beginPath(); ctx.ellipse(ak[0], ak[1], rk, rk * 0.26, 0, st, st + 3.4); ctx.stroke();
+      }
+    }
+
+    // snow: born at the foot, rises while circling; after the release it widens, slows and drifts down
+    if (t < REL) {
+      storm.acc += 540 * dt * (0.3 + 0.7 * smooth(t / 0.2));
+      while (storm.acc >= 1) {
+        storm.acc -= 1;
+        var flake = Math.random() < 0.07;
+        storm.parts.push({ born: t, life: 0.95 + Math.random() * 0.65, phi: Math.random() * 6.283, jit: Math.random() * 0.45 - 0.2, g: 0.6 + Math.random() * 0.8,
+          s: (flake ? 10 + Math.random() * 9 : 2.2 + Math.random() * 4.8) * u, flake: flake, blush: Math.random() < 0.25, rot: Math.random() * 6.283, vrot: (Math.random() - 0.5) * 3 });
+      }
+    }
+    var te = t < REL ? t : REL + (t - REL) * 0.35;         // the rise slows down once the tornado lets go
+    var fadeAll = 1 - smooth((t - REL - 0.1) / 0.8);
+    for (var n = storm.parts.length - 1; n >= 0; n--) {
+      var q = storm.parts[n], h = (te - q.born) / q.life;
+      if (h >= 1 || fadeAll <= 0) { storm.parts.splice(n, 1); continue; }
+      h = clamp01(h);
+      q.phi += omega(h) * dt; q.rot += q.vrot * dt;
+      var a = axis(h), r = rad(h) * (1 + q.jit + q.jit * 2.5 * spread);
+      var fall = q.g * 380 * u * Math.pow(Math.max(0, t - REL - 0.05), 2);
+      var x = a[0] + Math.cos(q.phi) * r, y = a[1] + Math.sin(q.phi) * r * 0.26 + fall;
+      var depth = 0.55 + 0.45 * Math.sin(q.phi);           // front of the funnel brighter and bigger than the back
+      ctx.globalAlpha = smooth(h / 0.08) * (1 - smooth((h - 0.84) / 0.16)) * fadeAll * (0.42 + 0.58 * depth);
+      var z = q.s * (0.7 + 0.3 * depth);
+      if (q.flake) { ctx.save(); ctx.translate(x, y); ctx.rotate(q.rot); ctx.drawImage(sp.flake, -z, -z, z * 2, z * 2); ctx.restore(); }
+      else ctx.drawImage(q.blush ? sp.blush : sp.snow, x - z * 2, y - z * 2, z * 4, z * 4);
+    }
+
+    ctx.globalAlpha = 1;
+    if (t > REL + 1.0) { stopStorm(); return; }
+    requestAnimationFrame(stepTornado);
+  }
+
+  // Variant "ribbon": one snowy spark leaves the window, flies to the centre in a wide arc and draws a ring of snow;
+  // the card appears inside the ring, and the snow of the ribbon quietly falls away.
+  function stepRibbon(ts) {
+    if (!storm.running) return;
+    var c = $('#storm'), ctx = c.getContext('2d'), W = innerWidth, H = innerHeight;
+    var t = (ts - storm.t0) / 1000, dt = Math.min(0.05, (ts - storm.last) / 1000); storm.last = ts;
+    var u = Math.min(W, H) / 1080, sp = storm.sprites;
+    var tx = W / 2, ty = H / 2 - 40 * u, R = 275 * u;
+    var d = Math.hypot(storm.ex - tx, storm.ey - ty), base = Math.atan2(storm.ey - ty, storm.ex - tx);
+    // One path and one easing for the whole flight: the spark spirals in from the window and goes once round the ring.
+    // The angle advances evenly along the path, so the spark never slows down between the flight and the ring.
+    var DUR = 1.28, TURN = 6.283 * 1.38, ENTER = 0.34;
+    var easeSine = function (v) { v = clamp01(v); return 0.5 - 0.5 * Math.cos(Math.PI * v); };
+    var smooth = function (v) { v = clamp01(v); return v * v * (3 - 2 * v); };
+    var pAt = function (tt) { return easeSine(tt / DUR); };
+    var posAt = function (pp) { var a2 = base - TURN * pp, r2 = d + (R - d) * smooth(pp / ENTER); return [tx + Math.cos(a2) * r2, ty + Math.sin(a2) * r2]; };
+    var pr = pAt(t), th = base - TURN * pr, pos = posAt(pr), lx = pos[0], ly = pos[1];
+    var thEntry = base - TURN * ENTER;
+    var endFade = clamp01((DUR + 1.05 - t) / 0.75);
+    ctx.clearRect(0, 0, W, H);
+
+    // a breath of cold light at the window
+    var breath = (110 + 180 * easeSine(t / 0.5)) * u, breathA = 0.4 * smooth(t / 0.12) * (1 - smooth((t - 0.15) / 0.55));
+    if (breathA > 0.01) { ctx.globalAlpha = breathA; ctx.drawImage(sp.snow, storm.ex - breath / 2, storm.ey - breath / 2, breath, breath); }
+
+    // soft light gathering inside the ring
+    var glow = smooth((pr - 0.55) / 0.45) * (1 - smooth((t - DUR - 0.05) / 0.55));
+    if (glow > 0.01) { var gs = R * 2.7; ctx.globalAlpha = 0.34 * glow; ctx.drawImage(sp.snow, tx - gs / 2, ty - gs / 2, gs, gs); }
+
+    // the thin line of the ring, drawn behind the spark as it goes round
+    if (pr > ENTER) {
+      ctx.globalAlpha = 0.46 * smooth((pr - ENTER) / 0.08) * (1 - smooth((t - DUR - 0.05) / 0.4));
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = Math.max(1, 1.4 * u); ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(tx, ty, R, Math.max(th, thEntry - 6.27), thEntry); ctx.stroke();
+    }
+
+    // snow shed by the spark, evenly along the path it covered since the last frame
+    if (t < DUR) {
+      var p0 = storm.lp == null ? pr : storm.lp, steps = Math.min(60, Math.max(1, Math.ceil(Math.hypot(lx - (storm.lx == null ? lx : storm.lx), ly - (storm.ly == null ? ly : storm.ly)) / (4 * u))));
+      for (var e = 0; e < steps; e++) {
+        var f = (e + Math.random()) / steps, at = posAt(p0 + (pr - p0) * f), flake = Math.random() < 0.06;
+        storm.parts.push({ x: at[0] + (Math.random() - 0.5) * 20 * u, y: at[1] + (Math.random() - 0.5) * 20 * u,
+          vx: (Math.random() - 0.5) * 30 * u, vy: (Math.random() - 0.5) * 30 * u,
+          s: (flake ? 9 + Math.random() * 9 : 1.8 + Math.random() * 5) * u, flake: flake, blush: Math.random() < 0.25,
+          born: t, life: 1.1 + Math.random() * 0.8, rot: Math.random() * 6.283, vrot: (Math.random() - 0.5) * 2.4 });
+      }
+      storm.lx = lx; storm.ly = ly; storm.lp = pr;
+    }
+    // after the ring closes the snow eases into a slow fall (gravity fades in, no jolt)
+    var falling = smooth((t - DUR + 0.15) / 0.6), drag = Math.pow(0.4, dt);
+    for (var n = storm.parts.length - 1; n >= 0; n--) {
+      var q = storm.parts[n], age = t - q.born;
+      if (age > q.life) { storm.parts.splice(n, 1); continue; }
+      q.vx *= drag; q.vy = q.vy * drag + 150 * u * falling * dt * 3; q.x += q.vx * dt; q.y += q.vy * dt; q.rot += q.vrot * dt;
+      ctx.globalAlpha = smooth(age / 0.12) * (1 - smooth((age - q.life + 0.55) / 0.55)) * endFade * 0.9;
+      if (q.flake) { ctx.save(); ctx.translate(q.x, q.y); ctx.rotate(q.rot); ctx.drawImage(sp.flake, -q.s, -q.s, q.s * 2, q.s * 2); ctx.restore(); }
+      else ctx.drawImage(q.blush ? sp.blush : sp.snow, q.x - q.s * 2, q.y - q.s * 2, q.s * 4, q.s * 4);
+    }
+
+    // the spark itself: a bright point with a small snowflake turning in it
+    var sparkA = 0.95 * (1 - smooth((t - DUR + 0.12) / 0.24));
+    if (sparkA > 0.01) {
+      var hs = 84 * u, fz = 16 * u;
+      ctx.globalAlpha = sparkA; ctx.drawImage(sp.snow, lx - hs / 2, ly - hs / 2, hs, hs);
+      ctx.save(); ctx.translate(lx, ly); ctx.rotate(t * 4); ctx.drawImage(sp.flake, -fz, -fz, fz * 2, fz * 2); ctx.restore();
+    }
+
+    ctx.globalAlpha = 1;
+    if ((t > DUR + 1.1 && !storm.parts.length) || t > 3.4) { stopStorm(); return; }
+    requestAnimationFrame(stepRibbon);
+  }
+
+  /* --- the draw: picked at the moment of the tap, weighted by what is left --- */
+  function randomUnit() {
+    if (window.crypto && crypto.getRandomValues) { var a = new Uint32Array(1); crypto.getRandomValues(a); return a[0] / 4294967296; }
+    return Math.random();
+  }
+  function pickGift() {
+    var pool = S.gifts.filter(function (g) { return isLive(g) && remaining(g) > 0; });
+    // Variety: the gift won last time sits this draw out, so the same gift does not come twice in a row.
+    // Exception: when that gift is more than all the others together, repeats cannot be avoided anyway,
+    // and sitting it out would hand the rare gifts out in the very first draws. Then the plain weighted draw stays.
+    // (Last winner: this page's own last draw, or the newest entry of the log after a reload.)
+    var lastId = S.lastGiftId || (S.draws[0] && S.draws[0].giftId) || null;
+    var last = lastId ? pool.filter(function (g) { return g.id === lastId; })[0] : null;
+    if (last) {
+      var others = pool.filter(function (g) { return g.id !== lastId; });
+      var othersLeft = others.reduce(function (n, g) { return n + remaining(g); }, 0);
+      if (others.length && othersLeft >= remaining(last)) pool = others;
+    }
+    var total = pool.reduce(function (s, g) { return s + remaining(g); }, 0);
+    if (!total) return null;
+    var x = randomUnit() * total;
+    for (var i = 0; i < pool.length; i++) { x -= remaining(pool[i]); if (x < 0) return pool[i]; }
+    return pool[pool.length - 1];
+  }
+  async function commitDraw(gift, door) {
+    var ref = S.db.doc('gifts/' + gift.id);
+    var won = (Number(gift.won) || 0) + 1;            // kiosk is the only writer of `won`; absolute value keeps a retry idempotent
+    try { await ref.update({ won: won, lastWonAt: Date.now() }); }
+    catch (e) {
+      if (e && e.code === 'unavailable') { await sleep(500 + Math.random() * 500); await ref.update({ won: won, lastWonAt: Date.now() }); }
+      else throw e;
+    }
+    S.lastGiftId = gift.id;
+    S.wonFloor[gift.id] = won;                          // the sheet write must not lag behind the snapshot
+    var id = 'd' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    S.db.doc('draws/' + id).set({ giftId: gift.id, giftName: gift.name || '', door: door, at: Date.now() }).catch(function () { /* log is best-effort */ });
+  }
+
+  async function onDoorTap(cell, t) {
+    if (S.mode !== 'idle') return;
+    requestWakeLock();
+    if (!S.db) { showNotice('Կապ չկա', 'Տվյալների բազան հասանելի չէ։ Մուտք գործեք claude.ai ձեր կազմակերպության հաշվով, ապա բացեք այս էջի հղումը։'); return; }
+    if (!S.ready) { showNotice('Մի պահ…', 'Նվերների ցանկը դեռ բեռնվում է։ Փորձեք մի քանի վայրկյանից։'); return; }
+    var gift = pickGift();
+    if (!gift) { showNotice('Նվերներն ավարտվել են', 'Այս պահին տրամադրելու նվեր չկա։ Խնդրում ենք դիմել աշխատակցին։'); return; }
+    S.mode = 'opening';
+    stopKnocks();
+    preloadGift(gift);
+    prepareReveal(gift);
+    cell.classList.add('is-open');
+    var stormTimer = setTimeout(function () { startStorm(cell); }, STORM.lead);     // once the leaf has swung away
+    var result = await Promise.all([commitDraw(gift, t.n).then(function () { return true; }, function (e) { return e || false; }), sleep(reduceMotion ? 100 : S.effect === 'vortex' ? STORM.vortex : STORM.total)]);
+    if (result[0] !== true) {
+      clearTimeout(stormTimer); stopStorm(); cancelReveal();
+      cell.classList.remove('is-open');
+      var denied = result[0] && (result[0].code === 'invalid_argument' || result[0].code === 'permission_denied');
+      if (denied) { S.noPlayRight = true; kioskStatus(); showNotice('Իրավունք չկա', 'Այս հաշիվը նվերներ գրանցելու իրավունք չունի։ Բացեք կիոսկի հատուկ հղումը (…/?key=…)։'); }
+      else showNotice('Չհաջողվեց գրանցել նվերը', 'Ստուգեք ինտերնետ կապը և թույլ տվեք մասնակցին կրկին ընտրել պատուհան։');
+      return;
+    }
+    if (storm.running) storm.revealT = (performance.now() - storm.t0) / 1000;   // the vortex melts away from this moment
+    showReveal(gift, cell);
+    // write Won / Remaining to the sheet once the card has settled, so the network work never lands mid-animation
+    setTimeout(function () { syncFromSheet('win'); }, 2400);
+  }
+
+  // Everything the card needs (picture, text, layout) is built at the tap, while the door swings on the
+  // compositor; the moment the card appears then only flips a class, so the snow animation never stutters there.
+  function prepareReveal(gift) {
+    var ov = $('#reveal'), stageBox = $('#rv-stage');
+    stageBox.textContent = '';
+    var pop = el('div', 'gift-pop'), flo = el('div', 'gift-float'), img = el('img', 'gift-img'), shine = el('div', 'gift-shine');
+    img.alt = ''; img.decoding = 'async';
+    var setShine = function () { var u = 'url("' + img.src + '")'; shine.style.webkitMaskImage = u; shine.style.maskImage = u; };
+    img.onerror = function () { img.onerror = null; img.src = 'giftcard.svg'; setShine(); };
+    img.src = gift.imageId ? imgUrl(gift.imageId) : 'giftcard.svg'; setShine();
+    flo.appendChild(img); flo.appendChild(shine); pop.appendChild(flo); stageBox.appendChild(pop);
+    var desc = $('#rv-name');
+    desc.textContent = gift.name || 'Նվեր';
+    ov.classList.remove('show', 'instant'); ov.classList.add('prep'); ov.hidden = false;
+    // A long gift name shrinks to stay between the fixed lines and the button.
+    var box = desc.parentNode, size = 38; desc.style.fontSize = '';
+    while (box.scrollHeight > box.clientHeight && size > 20) { size--; desc.style.fontSize = size + 'px'; }
+  }
+  function cancelReveal() { var ov = $('#reveal'); ov.classList.remove('prep', 'show'); ov.hidden = true; }
+
+  function showReveal(gift, cell) {
+    var ov = $('#reveal');
+    if (!ov.classList.contains('prep')) prepareReveal(gift);
+    ov.classList.remove('prep'); ov.classList.add('show');
+    setTimeout(function () { $('#storm-veil').classList.remove('on'); }, 420);   // the card's own dimming takes over from the storm's veil
+    S.mode = 'reveal'; S.revealAt = performance.now();
+    setTimeout(function () { var b = ov.querySelector('[data-close]'); if (b && S.mode === 'reveal') b.focus({ preventScroll: true }); }, 950);
+  }
+
+  function showNotice(title, text) {
+    $('#nt-title').textContent = title; $('#nt-text').textContent = text;
+    var ov = $('#notice'); ov.classList.remove('show'); ov.classList.add('instant'); ov.hidden = false; void ov.offsetWidth; ov.classList.add('show');
+    S.mode = 'notice';
+  }
+
+  function resetKiosk() {
+    ['#reveal', '#notice'].forEach(function (s) { var o = $(s); o.hidden = true; o.classList.remove('show', 'instant', 'prep'); });
+    stage.querySelectorAll('.door-cell.is-open').forEach(function (c) { c.classList.remove('is-open'); });
+    S.mode = 'idle';
+    startKnocks();
+    syncFromSheet('close');
+  }
+
+  /* --- "ՓԱԿԵԼ": closes the card and shuts every window for the next participant --- */
+  function wireClose(btn) {
+    btn.addEventListener('click', function () {
+      // Ignore taps while the card is still flying in, so the tap that opened the window cannot also close it.
+      if (S.mode === 'reveal' && performance.now() - (S.revealAt || 0) < 900) return;
+      resetKiosk();
+    });
+  }
+
+  /* --- idle invitation: a random window gives a little knock --- */
+  var knockTimer = 0;
+  function startKnocks() {
+    stopKnocks(); if (reduceMotion) return;
+    knockTimer = setInterval(function () {
+      if (S.mode !== 'idle' || document.hidden) return;
+      var cells = stage.querySelectorAll('.door-cell:not(.is-open)');
+      var c = cells[Math.floor(Math.random() * cells.length)]; if (!c) return;
+      c.classList.add('knock'); setTimeout(function () { c.classList.remove('knock'); }, 1050);
+    }, 3200);
+  }
+  function stopKnocks() { clearInterval(knockTimer); }
+
+  var wakeLock = null;
+  function requestWakeLock() {
+    if (wakeLock || !navigator.wakeLock) return;
+    navigator.wakeLock.request('screen').then(function (l) { wakeLock = l; l.addEventListener('release', function () { wakeLock = null; }); }).catch(function () {});
+  }
+
+  function kioskStatus() {
+    var s = $('#k-status'), msg = '';
+    if (S.capsResolved && !S.db) msg = 'Տվյալների բազան հասանելի չէ․ մուտք գործեք claude.ai, ապա բացեք էջի հղումը։';
+    else if (S.noPlayRight) msg = 'Այս հաշիվը նվերներ գրանցելու իրավունք չունի։ Բացեք կիոսկի հատուկ հղումը (…/?key=…)։';
+    else if (S.sync && !S.sync.ok && SYNC_ERR[S.sync.code]) msg = 'Google Sheet-ը չի կարդացվում․ նվերների ցանկը չի թարմանում (մանրամասները՝ #admin)։';
+    else if (S.ready && !S.gifts.some(function (g) { return isLive(g) && remaining(g) > 0; })) msg = 'Նվերների ցանկը դատարկ է կամ բոլորը տրված են․ ավելացրեք Google Sheet-ում։';
+    s.textContent = msg; s.hidden = !msg;
+  }
+
+  /* ================= ADMIN ================= */
+  var editing = null;           // gift id being edited
+  var pendingFile = null;       // resized Blob waiting for upload
+  var clearImage = false;
+  var previewUrl = '';
+
+  function toast(text) {
+    var t = el('div', 'toast', text); document.body.appendChild(t);
+    setTimeout(function () { t.remove(); }, 2200);
+  }
+  function setMsg(text, kind) { var m = $('#f-msg'); m.textContent = text || ''; m.className = 'form-msg' + (kind ? ' ' + kind : ''); }
+
+  function armButton(btn, label, action) {
+    // Two-step confirmation inside the page (the viewer has no confirm()).
+    var orig = btn.textContent, timer = 0;
+    btn.addEventListener('click', async function () {
+      if (!btn.classList.contains('armed')) {
+        btn.classList.add('armed'); btn.textContent = label;
+        timer = setTimeout(function () { btn.classList.remove('armed'); btn.textContent = orig; }, 4000);
+        return;
+      }
+      clearTimeout(timer); btn.classList.remove('armed'); btn.textContent = orig; btn.disabled = true;
+      try { await action(); } finally { btn.disabled = false; }
+    });
+  }
+
+  function renderAdmin() {
+    if ($('#admin').hidden) return;
+    var lock = $('#a-lock'), body = $('#a-body');
+    if (!S.capsResolved) { lock.hidden = false; lock.textContent = 'Բեռնվում է…'; body.hidden = true; return; }
+    if (!S.db) { lock.hidden = false; lock.textContent = 'Տվյալների բազան այս դիտման մեջ հասանելի չէ։ Բացեք էջը claude.ai-ում՝ ձեր կազմակերպության հաշվով։'; body.hidden = true; return; }
+    if (!S.canEdit) { lock.hidden = false; lock.textContent = 'Նվերները կառավարում է միայն էջի սեփականատերը։'; body.hidden = true; return; }
+    lock.hidden = true; body.hidden = false;
+    renderSheetStatus();
+
+    var active = S.gifts.filter(function (g) { return isLive(g) && remaining(g) > 0; });
+    $('#st-types').textContent = active.length;
+    $('#st-left').textContent = S.gifts.reduce(function (s, g) { return s + (isLive(g) ? remaining(g) : 0); }, 0);
+    $('#st-won').textContent = S.gifts.reduce(function (s, g) { return s + (Number(g.won) || 0); }, 0);
+
+    var list = $('#g-list'); list.textContent = '';
+    if (!S.ready) { list.appendChild(el('div', 'empty', 'Բեռնվում է…')); }
+    else if (!S.gifts.length) { list.appendChild(el('div', 'empty', 'Ցանկը դատարկ է։ Ավելացրեք առաջին նվերը «Նոր նվեր» ձևով․ այն անմիջապես կհայտնվի օրացույցում։')); }
+    S.gifts.forEach(function (g) {
+      var left = remaining(g), q = Number(g.quantity) || 0;
+      var row = el('div', 'gift-row' + (!isLive(g) ? ' off' : '') + (editing === g.id ? ' editing' : ''));
+      var th = el('div', 'gift-thumb');
+      if (g.imageId) { var im = el('img'); im.alt = ''; im.src = imgUrl(g.imageId); th.appendChild(im); }
+      else th.innerHTML = '<svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="9" width="18" height="11" rx="1.5"/><path d="M3 9h18M12 9v11"/><path d="M12 9c-2.2 0-4-1.4-4-3.2S9 3 10.4 3C11.8 3 12 5.5 12 9Z"/><path d="M12 9c2.2 0 4-1.4 4-3.2S15 3 13.6 3C12.2 3 12 5.5 12 9Z"/></svg>';
+      row.appendChild(th);
+      var main = el('div', 'gift-main');
+      main.appendChild(el('h3', null, g.name || 'Անանուն նվեր'));
+      var st = el('div', 'stock');
+      var bar = el('span', 'bar'); var bi = el('i'); bi.style.width = (q ? Math.round(left / q * 100) : 0) + '%'; bar.appendChild(bi); st.appendChild(bar);
+      st.appendChild(el('span', null, 'Մնացել ' + left + ' / ' + q + ' · տրվել է ' + (Number(g.won) || 0)));
+      if (g.inSheet === false) st.appendChild(el('span', 'pill paused', 'Հանված է աղյուսակից'));
+      else if (left === 0) st.appendChild(el('span', 'pill out', 'Ավարտվել է'));
+      else if (g.active === false) st.appendChild(el('span', 'pill paused', 'Դադարեցված'));
+      main.appendChild(st);
+      row.appendChild(main);
+
+      var acts = el('div', 'gift-actions');
+      var sw = el('label', 'switch'); var cb = el('input'); cb.type = 'checkbox'; cb.checked = g.active !== false; cb.id = 'act-' + g.id;
+      cb.addEventListener('change', function () { S.db.doc('gifts/' + g.id).update({ active: cb.checked }).catch(function () { cb.checked = !cb.checked; toast('Չհաջողվեց պահպանել'); }); });
+      sw.appendChild(cb); sw.appendChild(document.createTextNode('Ակտիվ')); acts.appendChild(sw);
+      var eb = el('button', 'btn', 'Խմբագրել'); eb.type = 'button'; eb.addEventListener('click', function () { startEdit(g); }); acts.appendChild(eb);
+      var delBtn = el('button', 'btn danger', 'Ջնջել'); delBtn.type = 'button';
+      armButton(delBtn, 'Հաստատե՞լ', async function () {
+        try {
+          await S.db.doc('gifts/' + g.id).delete();
+          if (g.imageId && S.assets) S.assets.delete(g.imageId).catch(function () {});
+          if (editing === g.id) resetForm();
+          toast('Ջնջվեց');
+        } catch (e) { toast('Չհաջողվեց ջնջել'); }
+      });
+      // A gift that is still in the sheet would simply come back, so it is removed there, not here.
+      if (!(g.source === 'sheet' && g.inSheet !== false)) acts.appendChild(delBtn);
+      row.appendChild(acts);
+      list.appendChild(row);
+    });
+
+    var lb = $('#log-body'); lb.textContent = '';
+    if (!S.draws.length) { var tr0 = el('tr'); var td0 = el('td', null, 'Դեռ նվեր չի տրվել։'); td0.colSpan = 3; td0.style.color = 'var(--faint)'; tr0.appendChild(td0); lb.appendChild(tr0); }
+    S.draws.forEach(function (d) {
+      var tr = el('tr'), dt = new Date(d.at || 0);
+      var when = dt.toLocaleDateString('hy-AM', { day: '2-digit', month: '2-digit' }) + ' ' + dt.toLocaleTimeString('hy-AM', { hour: '2-digit', minute: '2-digit' });
+      tr.appendChild(el('td', 'num', when)); tr.appendChild(el('td', 'num', '№ ' + (d.door || '—'))); tr.appendChild(el('td', null, d.giftName || ''));
+      lb.appendChild(tr);
+    });
+    $('#log-note').textContent = S.draws.length ? 'Ցուցադրվում են վերջին ' + S.draws.length + ' գրառումները։' : '';
+  }
+
+  function startEdit(g) {
+    editing = g.id; pendingFile = null; clearImage = false;
+    $('#f-title').textContent = 'Խմբագրել նվերը';
+    $('#g-name').value = g.name || ''; $('#g-qty').value = Number(g.quantity) || 0;
+    $('#g-qty').min = Number(g.won) || 0;
+    $('#g-qty-hint').textContent = 'Արդեն տրվել է ' + (Number(g.won) || 0) + '․ քանակը չի կարող դրանից պակաս լինել։';
+    var fromSheet = g.source === 'sheet';
+    $('#g-name').disabled = fromSheet; $('#g-qty').disabled = fromSheet;
+    if (fromSheet) $('#g-qty-hint').textContent = 'Անունն ու քանակը փոխվում են Google Sheet-ում։ Այստեղ կարող եք փոխել նկարը։ Արդեն տրվել է ' + (Number(g.won) || 0) + '։';
+    setPreview(g.imageId ? imgUrl(g.imageId) : '');
+    $('#f-submit').textContent = 'Պահպանել'; $('#f-cancel').hidden = false; setMsg('');
+    renderAdmin();
+    $('#g-form').scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'start' });
+    $('#g-name').focus({ preventScroll: true });
+  }
+  function resetForm() {
+    editing = null; pendingFile = null; clearImage = false;
+    $('#g-form').reset(); $('#g-qty').value = 1; $('#g-qty').min = 0;
+    $('#g-name').disabled = false; $('#g-qty').disabled = false;
+    $('#g-qty-hint').textContent = 'Քանի հատ կարելի է տալ։ Ավարտվելուց հետո նվերն այլևս չի ընկնում։';
+    $('#f-title').textContent = 'Նոր նվեր (աղյուսակից դուրս)'; $('#f-submit').textContent = 'Ավելացնել'; $('#f-cancel').hidden = true;
+    setPreview(''); renderAdmin();
+  }
+  function setPreview(src) {
+    var box = $('#g-preview'); box.textContent = '';
+    if (previewUrl && previewUrl !== src) { URL.revokeObjectURL(previewUrl); previewUrl = ''; }
+    if (src) { var im = el('img'); im.alt = 'Նկարի նախադիտում'; im.src = src; box.appendChild(im); $('#g-img-clear').hidden = false; }
+    else { box.textContent = 'Նկար չկա'; $('#g-img-clear').hidden = true; }
+  }
+
+  async function shrinkImage(file) {
+    // Keep loading light on the LED screen: max 1400 px, WebP keeps PNG transparency.
+    try {
+      var bmp = await createImageBitmap(file);
+      var scale = Math.min(1, 1400 / Math.max(bmp.width, bmp.height));
+      if (scale === 1 && file.size < 1500000) return file;
+      var c = document.createElement('canvas'); c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
+      c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+      var blob = await new Promise(function (res) { c.toBlob(res, 'image/webp', 0.9); });
+      return (blob && blob.type === 'image/webp') ? blob : file;
+    } catch (e) { return file; }
+  }
+
+  function wireAdmin() {
+    $('#g-img').addEventListener('change', async function (e) {
+      var f = e.target.files && e.target.files[0]; if (!f) return;
+      if (!/^image\/(png|jpeg|webp)$/.test(f.type)) { setMsg('Ընտրեք PNG, JPG կամ WEBP նկար։', 'err'); return; }
+      setMsg('Նկարը պատրաստվում է…');
+      pendingFile = await shrinkImage(f); clearImage = false;
+      var url = URL.createObjectURL(pendingFile);
+      setPreview(url); previewUrl = url;
+      setMsg('');
+    });
+    $('#g-img-btn').addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('#g-img').click(); } });
+    $('#g-img-clear').addEventListener('click', function () { pendingFile = null; clearImage = true; $('#g-img').value = ''; setPreview(''); });
+    $('#f-cancel').addEventListener('click', resetForm);
+    $('#sheet-link').href = SHEET.url;
+    $('#fx-select').addEventListener('change', function () {
+      var v = ['swirl', 'ribbon', 'tornado', 'galaxy', 'vortex'].indexOf(this.value) >= 0 ? this.value : 'vortex'; S.effect = v;
+      if (S.db) S.db.doc('config/kiosk').set({ effect: v }).then(function () { toast('Պահպանվեց'); }, function () { toast('Չհաջողվեց պահպանել'); });
+    });
+    $('#sheet-sync').addEventListener('click', function () { syncFromSheet('manual'); });
+
+    $('#g-form').addEventListener('submit', async function (e) {
+      e.preventDefault();
+      if (!S.db) return;
+      var name = $('#g-name').value.trim(), qty = Math.floor(Number($('#g-qty').value));
+      var current = editing ? S.gifts.find(function (g) { return g.id === editing; }) : null;
+      if (!name) { setMsg('Գրեք նվերի անվանումը։', 'err'); $('#g-name').focus(); return; }
+      if (!isFinite(qty) || qty < 0) { setMsg('Քանակը պետք է լինի 0 կամ ավելի ամբողջ թիվ։', 'err'); $('#g-qty').focus(); return; }
+      if (current && current.source !== 'sheet' && qty < (Number(current.won) || 0)) { setMsg('Արդեն տրվել է ' + current.won + ' հատ․ քանակը չի կարող դրանից պակաս լինել։', 'err'); $('#g-qty').focus(); return; }
+      var btn = $('#f-submit'); btn.disabled = true; setMsg('Պահպանվում է…');
+      try {
+        var imageId = current ? (current.imageId || null) : null, oldImage = null;
+        if (pendingFile) {
+          if (!S.assets) throw { code: 'no_assets' };
+          var up = await S.assets.upload(pendingFile, pendingFile.type ? undefined : { type: 'image/jpeg' });
+          oldImage = imageId; imageId = up.id;
+        } else if (clearImage) { oldImage = imageId; imageId = null; }
+        if (current) {
+          await S.db.doc('gifts/' + current.id).update(current.source === 'sheet' ? { imageId: imageId } : { name: name, quantity: qty, imageId: imageId });
+          toast('Պահպանվեց');
+        } else {
+          var id = 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+          await S.db.doc('gifts/' + id).set({ name: name, quantity: qty, won: 0, active: true, imageId: imageId, createdAt: Date.now() });
+          toast('Ավելացվեց');
+        }
+        if (oldImage && oldImage !== imageId && S.assets) S.assets.delete(oldImage).catch(function () {});
+        resetForm(); setMsg('');
+      } catch (err) {
+        var code = err && err.code;
+        setMsg(code === 'too_large' ? 'Նկարը չափազանց մեծ է։ Ընտրեք մինչև 20 ՄԲ նկար։'
+          : code === 'unsupported_type' ? 'Այս ֆայլի տեսակը չի աջակցվում։ Ընտրեք PNG, JPG կամ WEBP։'
+          : code === 'quota_or_state' || code === 'quota_exceeded' ? 'Պահոցի սահմանաչափը լրացել է։ Ջնջեք ավելորդ նվերներ և փորձեք կրկին։'
+          : code === 'no_assets' ? 'Նկար վերբեռնելու համար անհրաժեշտ է խմբագրման իրավունք։'
+          : 'Չհաջողվեց պահպանել։ Ստուգեք կապը և փորձեք կրկին։', 'err');
+      } finally { btn.disabled = false; }
+    });
+
+    async function deleteAllDraws() {
+      for (var round = 0; round < 20; round++) {
+        var snap = await S.db.collection('draws').limit(500).get();
+        if (snap.empty) break;
+        await Promise.all(snap.docs.map(function (d) { return S.db.doc('draws/' + d.id).delete(); }));
+      }
+    }
+    armButton($('#clear-log'), 'Հաստատե՞լ մաքրումը', async function () {
+      try { await deleteAllDraws(); toast('Պատմությունը մաքրվեց'); } catch (e) { toast('Չհաջողվեց մաքրել'); }
+    });
+    armButton($('#reset-all'), 'Հաստատե՞լ զրոյացումը', async function () {
+      try {
+        await Promise.all(S.gifts.map(function (g) { return S.db.doc('gifts/' + g.id).update({ won: 0 }); }));
+        S.wonFloor = {}; S.lastGiftId = null;
+        await deleteAllDraws();
+        setTimeout(function () { syncFromSheet('manual'); }, 400);   // the sheet's Won column goes back to 0 too toast('Տրված քանակները զրոյացվեցին');
+      } catch (e) { toast('Չհաջողվեց զրոյացնել'); }
+    });
+  }
+
+  /* ================= ROUTING + START ================= */
+  function route() {
+    var admin = location.hash === '#admin';
+    kiosk.hidden = admin; $('#admin').hidden = !admin;
+    document.documentElement.classList.toggle('is-kiosk', !admin);
+    if (admin) { stopKnocks(); renderAdmin(); } else { resetKiosk(); }
+  }
+
+  async function connect() {
+    var C = window.claude;
+    var use = function (n) { return (C && typeof C.use === 'function') ? C.use(n).catch(function () { return null; }) : Promise.resolve(null); };
+    var caps = await Promise.all([use('db'), use('assets'), use('user'), use('mcp')]);
+    S.db = caps[0]; S.assets = caps[1]; S.user = caps[2]; S.mcp = caps[3];
+    S.canEdit = S.user ? await S.user.isOwner() : false;   // only the owner manages gifts and syncs the sheet; a kiosk Editor just plays
+    S.canSync = (S.user && typeof S.user.canSync === 'function') ? await S.user.canSync().catch(function () { return false; }) : false;   // a self-hosted kiosk may sync too
+    S.capsResolved = true;
+    if (S.db) {
+      S.db.collection('gifts').onSnapshot(function (snap) {
+        S.gifts = snap.docs.map(function (d) { var o = Object.assign({}, d.data()); o.id = d.id; return o; })
+          .sort(function (a, b) { return (a.createdAt || 0) - (b.createdAt || 0); });
+        S.ready = true; renderAdmin(); kioskStatus();
+        if (!S.firstSync) { S.firstSync = true; syncFromSheet('load'); }
+      }, function () { kioskStatus(); });
+      S.db.doc('config/kiosk').onSnapshot(function (snap) {
+        var d = snap.exists ? snap.data() : null;
+        S.effect = (d && ['swirl', 'ribbon', 'tornado', 'galaxy', 'vortex'].indexOf(d.effect) >= 0) ? d.effect : 'vortex';
+        var sel = $('#fx-select'); if (sel) sel.value = S.effect;
+      }, function () {});
+      S.db.collection('draws').orderBy('at', 'desc').limit(100).onSnapshot(function (snap) {
+        S.draws = snap.docs.map(function (d) { return d.data(); }); renderAdmin();
+      }, function () {});
+    }
+    renderAdmin(); kioskStatus();
+    // Safety net for a sheet edited while nobody is tapping.
+    setInterval(function () { if (!document.hidden) syncFromSheet('timer'); }, 120000);
+  }
+
+  fit(); addEventListener('resize', fit);
+  buildDoors(); buildCardFx(); initSky();
+  requestAnimationFrame(drawSky);
+  document.querySelectorAll('[data-close]').forEach(wireClose);
+  wireAdmin();
+  $('#fs-btn').addEventListener('click', function () {
+    var d = document.documentElement;
+    if (document.fullscreenElement) { document.exitFullscreen && document.exitFullscreen().catch(function () {}); return; }
+    if (d.requestFullscreen) d.requestFullscreen().catch(function () {});
+    requestWakeLock();
+  });
+  kiosk.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  kiosk.addEventListener('click', function (e) {
+    if (S.fsBlocked || !document.fullscreenEnabled || document.fullscreenElement || location.hash === '#admin') return;
+    if (e.target.closest && e.target.closest('#fs-btn')) return;
+    e.stopPropagation(); e.preventDefault();          // this tap is spent on going full screen, not on a door
+    document.documentElement.requestFullscreen().catch(function () { S.fsBlocked = true; });
+    requestWakeLock();
+  }, true);
+  addEventListener('hashchange', route);
+  route();
+  connect();
+})();
+</script>
+
+</body>
+</html>
