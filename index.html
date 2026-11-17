@@ -285,6 +285,13 @@ button{font-family:inherit;}
 .confirm-box p{margin:0 0 22px;font-size:15px;line-height:1.5;color:var(--muted);}
 .confirm-actions{display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;}
 .confirm-actions .btn[disabled]{opacity:.45;cursor:not-allowed;}
+.a-set{margin-top:24px;padding:8px 22px;border-radius:18px;background:var(--surface);border:1px solid var(--line);}
+.a-set h2{margin:14px 0 8px;font-size:19px;font-weight:600;}
+.set-row{display:flex;flex-wrap:wrap;gap:10px 20px;align-items:center;justify-content:space-between;padding:14px 0;border-top:1px solid rgba(246,169,192,.14);}
+.set-text{flex:1 1 320px;min-width:0;display:flex;flex-direction:column;gap:3px;}
+.set-text strong{font-size:15px;font-weight:600;}
+.set-text span{font-size:13px;line-height:1.45;color:var(--muted);}
+.sec-hint{margin:-6px 0 0;font-size:13px;line-height:1.45;color:var(--muted);}
 .btn[disabled]{opacity:.5;cursor:not-allowed;}
 .stats{display:grid;grid-template-columns:repeat(auto-fit, minmax(min(180px,100%),1fr));gap:12px;}
 .stat{padding:16px 18px;border-radius:14px;background:var(--surface);border:1px solid var(--line);}
@@ -408,16 +415,6 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
         <div class="stat"><p>Արդեն տրվել է</p><strong id="st-won">0</strong></div>
       </div>
 
-      <section class="sheet-box" aria-labelledby="exp-title">
-        <div class="sheet-text">
-          <h2 id="exp-title">Արդյունքներ</h2>
-          <p>Ներբեռնեք ֆայլ Excel-ի համար՝ նվեր, քանակ, տրված, մնացած և խաղարկությունների պատմությունը։</p>
-        </div>
-        <div class="sheet-actions">
-          <button type="button" class="btn" id="export-csv">Ներբեռնել արդյունքները</button>
-        </div>
-      </section>
-
       <section class="sheet-box" aria-labelledby="sheet-title" hidden>
         <div class="sheet-text">
           <h2 id="sheet-title">Նվերների ցանկը՝ Google Sheet-ից</h2>
@@ -426,22 +423,6 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
         <div class="sheet-actions">
           <a class="btn ghost" id="sheet-link" target="_blank" rel="noopener">Բացել աղյուսակը</a>
           <button type="button" class="btn" id="sheet-sync">Թարմացնել հիմա</button>
-        </div>
-      </section>
-
-      <section class="sheet-box" aria-labelledby="fx-title">
-        <div class="sheet-text">
-          <h2 id="fx-title">Պատուհանի բացման էֆեկտ</h2>
-          <p>Ինչ է դուրս գալիս պատուհանից՝ մինչև նվերի քարտի հայտնվելը։</p>
-        </div>
-        <div class="sheet-actions">
-          <select id="fx-select" class="btn" aria-labelledby="fx-title">
-            <option value="vortex">Ձնե մրրիկ</option>
-            <option value="galaxy">Ձյան պտույտ (գալակտիկա)</option>
-            <option value="tornado">Ձյան տորնադո</option>
-            <option value="ribbon">Ձյան կայծ և օղակ</option>
-            <option value="swirl">Ձնապտույտ</option>
-          </select>
         </div>
       </section>
 
@@ -479,17 +460,15 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
 
         <section class="a-list" aria-labelledby="list-title">
           <h2 id="list-title">Նվերներ</h2>
+          <p class="sec-hint">Այստեղ երևում է՝ ինչ նվեր կա և քանիսն է մնացել։ «Ակտիվ»-ն անջատելիս նվերը ժամանակավորապես չի խաղարկվում։</p>
           <div id="g-list"></div>
         </section>
       </div>
 
       <section class="a-log" style="margin-top:24px" aria-labelledby="log-title">
         <div class="log-head">
-          <h2 id="log-title">Վերջին տրված նվերները</h2>
-          <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button type="button" class="btn danger" id="clear-log">Մաքրել պատմությունը</button>
-            <button type="button" class="btn danger" id="reset-all">Զրոյացնել թեստից հետո</button>
-          </div>
+          <h2 id="log-title">Տրված նվերների պատմություն</h2>
+          <button type="button" class="btn" id="export-csv">Ներբեռնել արդյունքները (Excel)</button>
         </div>
         <div class="table-wrap">
           <table>
@@ -498,6 +477,28 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
           </table>
         </div>
         <p class="hint" id="log-note" style="margin:0;font-size:13px;color:var(--faint)"></p>
+      </section>
+
+      <section class="a-set" aria-labelledby="set-title">
+        <h2 id="set-title">Կարգավորումներ</h2>
+        <div class="set-row">
+          <div class="set-text"><strong id="fx-title">Պատուհանի բացման էֆեկտ</strong><span>Ինչ է դուրս գալիս պատուհանից՝ մինչև նվերի քարտի հայտնվելը։</span></div>
+          <select id="fx-select" class="btn" aria-labelledby="fx-title">
+            <option value="vortex">Ձնե մրրիկ</option>
+            <option value="galaxy">Ձյան պտույտ (գալակտիկա)</option>
+            <option value="tornado">Ձյան տորնադո</option>
+            <option value="ribbon">Ձյան կայծ և օղակ</option>
+            <option value="swirl">Ձնապտույտ</option>
+          </select>
+        </div>
+        <div class="set-row">
+          <div class="set-text"><strong>Զրոյացում թեստից հետո</strong><span>Բոլոր նվերների «տրված» քանակը դառնում է 0, և պատմությունը ջնջվում է։ Արեք մեկ անգամ՝ խաղարկությունը սկսելուց առաջ։</span></div>
+          <button type="button" class="btn danger" id="reset-all">Զրոյացնել թեստից հետո</button>
+        </div>
+        <div class="set-row">
+          <div class="set-text"><strong>Պատմության մաքրում</strong><span>Ջնջվում է միայն տրված նվերների ցուցակը․ քանակները չեն փոխվում։</span></div>
+          <button type="button" class="btn danger" id="clear-log">Մաքրել պատմությունը</button>
+        </div>
       </section>
     </div>
   </div>
