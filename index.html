@@ -291,7 +291,14 @@ button{font-family:inherit;}
 .set-text{flex:1 1 320px;min-width:0;display:flex;flex-direction:column;gap:3px;}
 .set-text strong{font-size:15px;font-weight:600;}
 .set-text span{font-size:13px;line-height:1.45;color:var(--muted);}
-.sec-hint{margin:-6px 0 0;font-size:13px;line-height:1.45;color:var(--muted);}
+.sec-hint{margin:4px 0 0;font-size:13px;line-height:1.45;color:var(--muted);}
+.a-sec{margin:0 0 12px;}
+.a-sec h2{margin:0;font-size:19px;font-weight:600;}
+#a-body .a-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:start;}
+#a-body .a-form{grid-column:1;max-width:none;}
+#a-body .a-list{grid-column:2 / 4;}
+#a-body .gift-actions{flex:none;flex-wrap:nowrap;}
+@media (max-width:860px){#a-body .a-grid{grid-template-columns:minmax(0,1fr);}#a-body .a-form,#a-body .a-list{grid-column:1;}}
 .btn[disabled]{opacity:.5;cursor:not-allowed;}
 .stats{display:grid;grid-template-columns:repeat(auto-fit, minmax(min(180px,100%),1fr));gap:12px;}
 .stat{padding:16px 18px;border-radius:14px;background:var(--surface);border:1px solid var(--line);}
@@ -428,6 +435,10 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
         </div>
       </section>
 
+      <div class="a-sec">
+        <h2 id="list-title">Նվերներ</h2>
+        <p class="sec-hint">Այստեղ երևում է՝ ինչ նվեր կա և քանիսն է մնացել։ «Ակտիվ»-ն անջատելիս նվերը ժամանակավորապես չի խաղարկվում։</p>
+      </div>
       <div class="a-grid">
         <form class="a-form" id="g-form" novalidate>
           <h2 id="f-title">Նոր նվեր</h2>
@@ -461,8 +472,6 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
         </form>
 
         <section class="a-list" aria-labelledby="list-title">
-          <h2 id="list-title">Նվերներ</h2>
-          <p class="sec-hint">Այստեղ երևում է՝ ինչ նվեր կա և քանիսն է մնացել։ «Ակտիվ»-ն անջատելիս նվերը ժամանակավորապես չի խաղարկվում։</p>
           <div id="g-list"></div>
         </section>
       </div>
